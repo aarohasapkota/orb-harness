@@ -1,0 +1,25 @@
+{
+  "$comment": "harness-result/1 — the shared evidence contract every worker writes to its task dir as result.json. Validated by `harness result validate` and by the worker Stop hook. Fields marked required must exist; enums are enforced.",
+  "schema_version": "harness-result/1",
+  "required": ["schema_version", "run_id", "task_id", "agent", "role", "principal_id", "status", "risk_level", "revision",
+               "scope_examined", "actions", "files_changed", "evidence", "findings", "tests", "claims", "unresolved", "handoff"],
+  "enums": {
+    "status": ["PASS", "FAIL", "BLOCKED", "NOT_APPLICABLE", "NEEDS_REVIEW"],
+    "severity": ["info", "low", "medium", "high", "critical"],
+    "finding_status": ["open", "remediated", "false_positive", "accepted", "waived", "duplicate"],
+    "evidence_type": ["command", "test-run", "build", "scan", "secrets-scan", "diff", "review", "analysis", "document", "artifact-hash", "reproduction"]
+  },
+  "fields": {
+    "status": "PASS = your role's checks succeeded with evidence. FAIL = a blocking problem exists. BLOCKED = you could not perform a required check (missing tool/context/authority). NOT_APPLICABLE = role does not apply; needs not_applicable_reason. NEEDS_REVIEW = a human decision is required.",
+    "revision": "output of `harness rev` after your last change (writers) or at review time (readers). The gate rejects stale evidence.",
+    "files_changed": "exact paths you modified. MUST be empty for read-only roles.",
+    "evidence[]": "{id, type, command?, cwd?, exit_code?, status?, summary, artifact?} — command evidence needs the exact command and exit code.",
+    "findings[]": "{id, severity, confidence, location, description, recommendation, blocking, status, requirement_or_rule?}",
+    "tests": "{executed[], passed[], failed[]} — names of test targets or commands actually run.",
+    "claims[]": "{statement, evidence_refs[]} — every material claim points at evidence ids.",
+    "packs_loaded[]": "practice pack ids you read.",
+    "requirements_covered[]": "requirement ids (e.g. PW.5.1, OWASP-A03) you verified.",
+    "handoff": "{next_agent, reason}",
+    "summary": "free text, <= 400 chars, for the orchestrator"
+  }
+}

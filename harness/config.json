@@ -1,0 +1,28 @@
+{
+  "worker_model": "sonnet",
+  "worker_effort": "high",
+  "worker_permission_mode": "auto",
+  "orchestrator_principal": "orchestrator:fable-5.1",
+  "terminal": "cmux",
+  "return_to_main_tab": true,
+  "ghostty_new_tab_keys": {
+    "key_code": 17,
+    "modifiers": [
+      "command down"
+    ],
+    "$comment": "cmd+T (key code 17 = t)"
+  },
+  "ghostty_prev_tab_keys": {
+    "key_code": 33,
+    "modifiers": [
+      "command down",
+      "shift down"
+    ],
+    "$comment": "cmd+shift+[ (key code 33 = [) returns focus to your tab"
+  },
+  "ghostty_tab_settle_seconds": 0.8,
+  "max_remediation_cycles": 2,
+  "r3_requires_human_approval": true,
+  "cmux_focus_new_workspace": false,
+  "$terminal_comment": "orb-harness requires cmux: workers are spawned as cmux workspaces over its Unix socket. Start `claude` inside a cmux tab. Override per call with `harness spawn --terminal bg` (or HARNESS_TERMINAL) only for debugging."
+}

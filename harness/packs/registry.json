@@ -1,0 +1,24 @@
+{
+  "$comment": "Installed practice packs. Identity is id+version; path is organizational. Regenerate listing with `harness packs --list`.",
+  "packs": [
+    {"id": "nist-ssdf", "class": "baseline", "path": "nist-ssdf.md"},
+    {"id": "nist-ssdf-ai", "class": "baseline-ai", "path": "nist-ssdf-ai.md", "requires": ["nist-ssdf"]},
+    {"id": "secrets", "class": "always", "path": "secrets.md"},
+    {"id": "owasp-appsec", "class": "domain", "path": "owasp-appsec.md"},
+    {"id": "owasp-llm", "class": "domain-ai", "path": "owasp-llm.md"},
+    {"id": "openssf-dependencies", "class": "domain", "path": "openssf-dependencies.md"},
+    {"id": "supply-chain-provenance", "class": "domain", "path": "supply-chain-provenance.md"},
+    {"id": "web-api", "class": "domain", "path": "web-api.md"},
+    {"id": "auth-identity", "class": "domain", "path": "auth-identity.md"},
+    {"id": "cryptography", "class": "domain", "path": "cryptography.md"},
+    {"id": "data-migration", "class": "domain", "path": "data-migration.md"},
+    {"id": "ci-cd-build-integrity", "class": "domain", "path": "ci-cd-build-integrity.md"},
+    {"id": "ai-agent-tool-execution", "class": "domain-ai", "path": "ai-agent-tool-execution.md"},
+    {"id": "vulnerability-response", "class": "domain", "path": "vulnerability-response.md"},
+    {"id": "release-integrity", "class": "domain", "path": "release-integrity.md"},
+    {"id": "language.python", "class": "language", "path": "language/python.md"},
+    {"id": "language.javascript-typescript", "class": "language", "path": "language/javascript-typescript.md"},
+    {"id": "language.go", "class": "language", "path": "language/go.md"},
+    {"id": "project.policy", "class": "project-overlay", "path": "<repo>/.harness/policy/project-pack.md (optional)"}
+  ]
+}

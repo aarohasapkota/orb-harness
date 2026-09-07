@@ -1,0 +1,1729 @@
+#!/usr/bin/env python3
+"""
+harness — control plane for the Claude Code secure-SDLC harness.
+
+The orchestrator session (Fable) runs in the user's Ghostty tab and calls this
+CLI to create runs, define work packages, spawn Sonnet worker sessions into new
+terminal tabs, wait for their evidence, and evaluate the deterministic policy
+gate. Worker sessions call it to get their run envelope, applicable practice
+packs, the current revision id, and to validate their result contract.
+
+Nothing here calls a model. Every decision the gate makes is computed from
+structured evidence files under <project>/.harness/runs/<run-id>/.
+"""
+import argparse
+import datetime as _dt
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+import uuid
+
+HARNESS_HOME = os.path.expanduser(os.path.expandvars(os.environ.get("HARNESS_HOME", "~/.claude/harness")))
+CONFIG_PATH = os.path.join(HARNESS_HOME, "config.json")
+POLICY_PATH = os.path.join(HARNESS_HOME, "policy", "gate-policy.json")
+SCHEMA_PATH = os.path.join(HARNESS_HOME, "schemas", "result.schema.json")
+PACKS_DIR = os.path.join(HARNESS_HOME, "packs")
+LAUNCH_DIR = os.path.join(HARNESS_HOME, "launch")
+PREAMBLE_PATH = os.path.join(HARNESS_HOME, "templates", "worker-preamble.md")
+
+GATE_EXIT = {"PASS": 0, "FAIL": 1, "NEEDS_HUMAN": 2, "NOT_APPLICABLE": 3}
+
+
+# ----------------------------------------------------------------------------
+# small utilities
+# ----------------------------------------------------------------------------
+
+def now_iso():
+    return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def load_json(path, default=None):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        if default is not None:
+            return default
+        raise
+
+
+def save_json(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, sort_keys=False)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def sha256_text(text):
+    return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def config():
+    return load_json(CONFIG_PATH, default={})
+
+
+def die(msg, code=1):
+    print(f"harness: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def project_root(start=None):
+    """Project root = nearest ancestor containing .harness, else git toplevel, else cwd."""
+    start = os.path.abspath(start or os.getcwd())
+    cur = start
+    while True:
+        if os.path.isdir(os.path.join(cur, ".harness")):
+            return cur
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    try:
+        out = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=start,
+                             capture_output=True, text=True, check=True).stdout.strip()
+        if out:
+            return out
+    except Exception:
+        pass
+    return start
+
+
+def runs_dir(root):
+    return os.path.join(root, ".harness", "runs")
+
+
+def run_dir(root, run_id):
+    d = os.path.join(runs_dir(root), run_id)
+    if not os.path.isdir(d):
+        die(f"run '{run_id}' not found under {runs_dir(root)}")
+    return d
+
+
+def latest_run_id(root):
+    d = runs_dir(root)
+    if not os.path.isdir(d):
+        return None
+    ids = sorted(x for x in os.listdir(d) if os.path.isdir(os.path.join(d, x)))
+    return ids[-1] if ids else None
+
+
+def resolve_run(root, run_id):
+    if run_id in (None, "", "latest"):
+        rid = os.environ.get("HARNESS_RUN") or latest_run_id(root)
+        if not rid:
+            die("no run id given and no runs exist; create one with: harness run new --request '...'")
+        return rid
+    return run_id
+
+
+def audit(root, run_id, event_type, data, actor=None):
+    """Append-only, hash-chained audit trail per run."""
+    rd = os.path.join(runs_dir(root), run_id)
+    path = os.path.join(rd, "audit.jsonl")
+    prev = "sha256:genesis"
+    seq = 0
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    seq += 1
+                    prev = json.loads(line).get("event_digest", prev)
+    ev = {
+        "event_id": "evt-" + uuid.uuid4().hex[:12],
+        "sequence": seq + 1,
+        "timestamp": now_iso(),
+        "event_type": event_type,
+        "actor": actor or os.environ.get("HARNESS_PRINCIPAL") or config().get("orchestrator_principal", "orchestrator"),
+        "data": data,
+        "previous_event_digest": prev,
+    }
+    ev["event_digest"] = sha256_text(json.dumps(ev, sort_keys=True))
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(ev) + "\n")
+
+
+# ----------------------------------------------------------------------------
+# revision identity
+# ----------------------------------------------------------------------------
+
+def git(root, *args):
+    return subprocess.run(["git", *args], cwd=root, capture_output=True, text=True)
+
+
+def is_git(root):
+    r = git(root, "rev-parse", "--is-inside-work-tree")
+    return r.returncode == 0 and r.stdout.strip() == "true"
+
+
+def revision_id(root):
+    """Stable identifier of the exact working-tree content being gated.
+
+    git repos: git:<HEAD>+wt:<digest of tracked diff + untracked file contents>
+    non-git:  tree:<digest of relative path, size, mtime for every file>
+    """
+    if is_git(root):
+        head = git(root, "rev-parse", "HEAD").stdout.strip() or "unborn"
+        diff = git(root, "diff", "HEAD", "--", ".", ":(exclude).harness").stdout
+        h = hashlib.sha256(diff.encode("utf-8", "replace"))
+        untracked = git(root, "ls-files", "--others", "--exclude-standard").stdout.split("\n")
+        for rel in sorted(u for u in untracked if u and not u.startswith(".harness")):
+            p = os.path.join(root, rel)
+            if os.path.isfile(p):
+                h.update(rel.encode())
+                with open(p, "rb") as f:
+                    h.update(hashlib.sha256(f.read()).digest())
+        return f"git:{head[:12]}+wt:{h.hexdigest()[:16]}"
+    h = hashlib.sha256()
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if d not in (".harness", ".git", "node_modules", ".venv", "__pycache__"))
+        for fn in sorted(filenames):
+            p = os.path.join(dirpath, fn)
+            try:
+                st = os.stat(p)
+            except OSError:
+                continue
+            h.update(f"{os.path.relpath(p, root)}|{st.st_size}|{int(st.st_mtime)}\n".encode())
+    return f"tree:{h.hexdigest()[:16]}"
+
+
+def changed_files(root, since_rev_note=None):
+    """Files changed in the working tree relative to HEAD (git only)."""
+    if not is_git(root):
+        return []
+    out = git(root, "status", "--porcelain", "--", ".", ":(exclude).harness").stdout
+    files = []
+    for line in out.splitlines():
+        if len(line) > 3:
+            path = line[3:].strip()
+            if " -> " in path:
+                path = path.split(" -> ", 1)[1]
+            files.append(path)
+    return files
+
+
+# ----------------------------------------------------------------------------
+# risk classification helper (hints only; the orchestrator decides)
+# ----------------------------------------------------------------------------
+
+RISK_PATTERNS = [
+    # (regex, change_type, minimum_risk, reason)
+    (r"(^|/)(auth|authn|authz|login|session|oauth|sso|jwt|passport|permission|rbac|acl)[^/]*", "authentication", "R3", "authentication/authorization surface"),
+    (r"(^|/)(crypto|cipher|kms|hsm|signing|signature|tls|ssl)[^/]*", "cryptography", "R3", "cryptography"),
+    (r"(^|/)(secret|credential|vault|\.env|keychain)[^/]*", "secrets", "R3", "secret handling"),
+    (r"(^|/)\.github/workflows/|(^|/)\.gitlab-ci|(^|/)Jenkinsfile|(^|/)\.circleci/|(^|/)azure-pipelines|(^|/)bitbucket-pipelines", "ci_cd", "R3", "CI/CD trust path"),
+    (r"(^|/)(Dockerfile|docker-compose[^/]*|k8s/|kubernetes/|helm/|terraform/|\.tf$|pulumi|ansible/|cloudformation)", "infrastructure", "R3", "deployment infrastructure"),
+    (r"(^|/)(agent|agents|tools?|mcp|prompt|prompts|llm|openai|anthropic|langchain|retriev|rag)[^/]*", "ai_agent", "R3", "AI/agent/tool-calling surface"),
+    (r"(^|/)(sandbox|exec|eval|subprocess|shell|spawn)[^/]*", "tool_execution", "R3", "code execution path"),
+    (r"(^|/)(migrations?|schema|alembic|prisma/|flyway|liquibase)[^/]*", "database_schema", "R2", "schema/migration"),
+    (r"(^|/)(package\.json|package-lock\.json|yarn\.lock|pnpm-lock\.yaml|requirements[^/]*\.txt|pyproject\.toml|poetry\.lock|Pipfile[^/]*|go\.mod|go\.sum|Cargo\.toml|Cargo\.lock|Gemfile[^/]*|pom\.xml|build\.gradle[^/]*|composer\.(json|lock))$", "dependency", "R2", "dependency manifest/lock"),
+    (r"(^|/)(api|routes?|controllers?|handlers?|endpoints?|graphql|grpc|webhooks?|callbacks?)[^/]*", "public_api", "R2", "externally reachable interface"),
+    (r"(^|/)(upload|parser|parse|deserializ|unmarshal|multipart)[^/]*", "input_processing", "R2", "untrusted input parsing"),
+    (r"(^|/)(logging|logger|audit)[^/]*", "logging_observability", "R2", "security-relevant logging"),
+    (r"(^|/)(setup\.py|setup\.cfg|Makefile|CMakeLists\.txt|webpack|vite\.config|tsconfig|babel\.config|rollup)[^/]*", "build_configuration", "R2", "build configuration"),
+    (r"\.(md|mdx|rst|txt|adoc)$|(^|/)docs?/|(^|/)LICENSE|(^|/)CHANGELOG", "documentation", "R0", "documentation"),
+    (r"(^|/)(tests?|__tests__|spec|specs)/|[._-](test|spec)\.[a-z]+$|^test_", "test_only", "R1", "tests"),
+]
+RISK_ORDER = {"R0": 0, "R1": 1, "R2": 2, "R3": 3}
+
+
+def classify_paths(paths):
+    hints = []
+    max_risk = "R1" if paths else "R0"
+    doc_only = True
+    for p in paths:
+        matched = False
+        for rx, ctype, risk, reason in RISK_PATTERNS:
+            if re.search(rx, p, re.IGNORECASE):
+                hints.append({"path": p, "change_type": ctype, "min_risk": risk, "reason": reason})
+                if RISK_ORDER[risk] > RISK_ORDER[max_risk]:
+                    max_risk = risk
+                if ctype != "documentation":
+                    doc_only = False
+                matched = True
+                break
+        if not matched:
+            doc_only = False
+            hints.append({"path": p, "change_type": "business_logic", "min_risk": "R1", "reason": "executable file (default)"})
+    if paths and doc_only:
+        max_risk = "R0"
+    return {"suggested_min_risk": max_risk, "doc_only": doc_only, "hints": hints,
+            "note": "Hints only. The orchestrator MUST classify using the highest-risk applicable characteristic and MAY raise, never lower below these hints without recorded evidence."}
+
+
+# ----------------------------------------------------------------------------
+# runs
+# ----------------------------------------------------------------------------
+
+def cmd_run_new(args):
+    root = project_root()
+    rid = _dt.datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:4]
+    rd = os.path.join(runs_dir(root), rid)
+    os.makedirs(os.path.join(rd, "tasks"), exist_ok=True)
+    os.makedirs(os.path.join(rd, "waivers"), exist_ok=True)
+    os.makedirs(os.path.join(rd, "approvals"), exist_ok=True)
+    # keep evidence out of version control without touching tracked files
+    if is_git(root):
+        excl = os.path.join(root, ".git", "info", "exclude")
+        try:
+            os.makedirs(os.path.dirname(excl), exist_ok=True)
+            existing = open(excl).read() if os.path.exists(excl) else ""
+            if ".harness/" not in existing:
+                with open(excl, "a") as f:
+                    f.write("\n# claude harness evidence (local)\n.harness/\n")
+        except OSError:
+            pass
+    base_rev = revision_id(root)
+    run = {
+        "schema_version": "engineering-orchestrator/v1",
+        "run_id": rid,
+        "created_at": now_iso(),
+        "project_root": root,
+        "request": {"summary": args.request or "", "mode": args.mode or "CHANGE", "acceptance_criteria": []},
+        "repository": {"baseline_revision": base_rev, "preexisting_changes": changed_files(root), "is_git": is_git(root)},
+        "classification": {
+            "primary_change_type": None, "secondary_change_types": [],
+            "externally_exposed": None, "security_boundary_affected": None, "privilege_boundary_affected": None,
+            "persistent_data_affected": None, "third_party_code_added": None, "build_or_release_path_affected": None,
+            "untrusted_input_affected": None, "irreversible_effect_possible": None,
+        },
+        "risk": {"level": None, "triggers": [], "downgrade_allowed": False, "history": []},
+        "workflow": {"model": None, "source": None, "stages": []},
+        "ai_scope": "none",
+        "languages": [],
+        "scope": {"allowed_paths": [], "forbidden_paths": []},
+        "not_applicable": {},
+        "remediation_cycles": 0,
+        "status": {"state": "PENDING", "blockers": [], "uncertainties": []},
+    }
+    save_json(os.path.join(rd, "run.json"), run)
+    audit(root, rid, "RUN_CREATED", {"request": run["request"], "baseline_revision": base_rev})
+    print(json.dumps({"run_id": rid, "run_dir": rd, "baseline_revision": base_rev,
+                      "preexisting_changes": run["repository"]["preexisting_changes"],
+                      "next": "classify, then: harness run set <run> risk=R? mode=CHANGE change_types=a,b flags.externally_exposed=true ..."}, indent=2))
+
+
+def _set_path(obj, dotted, value):
+    parts = dotted.split(".")
+    cur = obj
+    for p in parts[:-1]:
+        cur = cur.setdefault(p, {})
+    cur[parts[-1]] = value
+
+
+def _coerce(v):
+    if v.lower() in ("true", "false"):
+        return v.lower() == "true"
+    if v.lower() in ("null", "none"):
+        return None
+    if re.fullmatch(r"-?\d+", v):
+        return int(v)
+    if "," in v:
+        return [x.strip() for x in v.split(",") if x.strip()]
+    return v
+
+
+def cmd_run_set(args):
+    root = project_root()
+    rid = resolve_run(root, args.run)
+    rd = run_dir(root, rid)
+    run = load_json(os.path.join(rd, "run.json"))
+    changes = {}
+    for kv in args.assignments:
+        if "=" not in kv:
+            die(f"bad assignment '{kv}', expected key=value")
+        k, v = kv.split("=", 1)
+        val = _coerce(v)
+        alias = {
+            "risk": "risk.level", "mode": "request.mode", "request": "request.summary",
+            "workflow": "workflow.model", "workflow_source": "workflow.source", "stages": "workflow.stages",
+            "change_types": "classification.secondary_change_types", "primary": "classification.primary_change_type",
+            "acceptance": "request.acceptance_criteria", "triggers": "risk.triggers",
+            "allowed_paths": "scope.allowed_paths", "forbidden_paths": "scope.forbidden_paths",
+            "state": "status.state",
+        }
+        k = alias.get(k, k)
+        if k.startswith("flags."):
+            k = "classification." + k[len("flags."):]
+        if k.startswith("na."):
+            k = "not_applicable." + k[len("na."):]
+        if k in ("request.acceptance_criteria", "risk.triggers", "workflow.stages", "classification.secondary_change_types",
+                 "scope.allowed_paths", "scope.forbidden_paths", "languages") and isinstance(val, str):
+            val = [val]
+        if k == "risk.level":
+            if val not in RISK_ORDER:
+                die("risk must be one of R0 R1 R2 R3")
+            prev = run["risk"].get("level")
+            if prev and RISK_ORDER[val] < RISK_ORDER[prev] and not args.justify:
+                die(f"risk downgrade {prev} -> {val} requires --justify '<evidence>'")
+            run["risk"]["history"].append({"at": now_iso(), "from": prev, "to": val, "justification": args.justify})
+        _set_path(run, k, val)
+        changes[k] = val
+    save_json(os.path.join(rd, "run.json"), run)
+    audit(root, rid, "RUN_UPDATED", changes)
+    print(json.dumps({"run_id": rid, "updated": changes}, indent=2))
+
+
+def cmd_run_show(args):
+    root = project_root()
+    rid = resolve_run(root, args.run)
+    print(json.dumps(load_json(os.path.join(run_dir(root, rid), "run.json")), indent=2))
+
+
+def cmd_runs(args):
+    root = project_root()
+    d = runs_dir(root)
+    if not os.path.isdir(d):
+        print("no runs")
+        return
+    for rid in sorted(os.listdir(d)):
+        p = os.path.join(d, rid, "run.json")
+        if os.path.exists(p):
+            r = load_json(p)
+            print(f"{rid}  risk={r['risk'].get('level')}  state={r['status'].get('state')}  {r['request'].get('summary','')[:70]}")
+
+
+def cmd_classify(args):
+    paths = list(args.paths or [])
+    if args.git:
+        root = project_root()
+        paths += changed_files(root)
+    print(json.dumps(classify_paths(paths), indent=2))
+
+
+# ----------------------------------------------------------------------------
+# tasks (work packages)
+# ----------------------------------------------------------------------------
+
+ROLES = ["context", "requirements", "governance", "threat-model", "architecture-review", "dependency-review",
+         "domain-specialist", "implementer", "test-verification", "code-review", "security-review",
+         "security-testing", "ai-adversarial-testing", "build-security", "secure-defaults", "release-integrity",
+         "vulnerability-discovery", "triage", "remediation", "root-cause", "regression-prevention", "other"]
+
+WRITE_ROLES = {"implementer", "remediation", "regression-prevention", "domain-specialist"}
+
+
+def task_dir(rd, task_id):
+    return os.path.join(rd, "tasks", task_id)
+
+
+def cmd_task_new(args):
+    root = project_root()
+    rid = resolve_run(root, args.run)
+    rd = run_dir(root, rid)
+    run = load_json(os.path.join(rd, "run.json"))
+    if args.role not in ROLES:
+        die(f"role must be one of: {', '.join(ROLES)}")
+    agent_path = os.path.expanduser(f"~/.claude/agents/{args.agent}.md")
+    if not os.path.exists(agent_path):
+        die(f"agent definition not found: {agent_path}")
+    td = task_dir(rd, args.id)
+    if os.path.exists(td):
+        die(f"task '{args.id}' already exists")
+    os.makedirs(td)
+    if args.package_file:
+        pkg = open(args.package_file, encoding="utf-8").read()
+    elif not sys.stdin.isatty():
+        pkg = sys.stdin.read()
+    else:
+        die("provide --package-file or pipe the work package on stdin")
+    write = bool(args.write) or (args.role in WRITE_ROLES and args.write is None)
+    if args.role in ("code-review", "security-review", "security-testing", "ai-adversarial-testing", "test-verification",
+                     "threat-model", "architecture-review", "requirements", "context", "dependency-review", "release-integrity",
+                     "triage", "root-cause", "vulnerability-discovery", "governance", "secure-defaults", "build-security") and write:
+        die(f"role '{args.role}' is read-only with respect to product code; drop --write")
+    task = {
+        "task_id": args.id, "run_id": rid, "agent": args.agent, "role": args.role,
+        "principal_id": f"agent:{args.agent}", "write": write,
+        "depends_on": [x for x in (args.depends or "").split(",") if x],
+        "retry_of": args.retry_of, "title": args.title or f"{args.role} ({args.agent})",
+        "created_at": now_iso(), "spawned_at": None, "spawn_backend": None, "revision_at_spawn": None,
+        "expected_revision": args.revision,
+    }
+    save_json(os.path.join(td, "task.json"), task)
+    with open(os.path.join(td, "package.md"), "w", encoding="utf-8") as f:
+        f.write(pkg)
+    audit(root, rid, "TASK_CREATED", {"task": task})
+    print(json.dumps({"run_id": rid, "task_id": args.id, "task_dir": td, "write": write,
+                      "next": f"harness spawn --run {rid} --task {args.id}"}, indent=2))
+
+
+def cmd_task_list(args):
+    root = project_root()
+    rid = resolve_run(root, args.run)
+    rd = run_dir(root, rid)
+    for t in _tasks(rd):
+        res = t.get("result") or {}
+        print(f"{t['task_id']:<18} {t['role']:<22} {t['agent']:<24} write={str(t['write']):<5} "
+              f"spawned={'yes' if t.get('spawned_at') else 'no ':<3} result={res.get('status') or '-'}")
+
+
+def _tasks(rd):
+    out = []
+    tdir = os.path.join(rd, "tasks")
+    if not os.path.isdir(tdir):
+        return out
+    for tid in sorted(os.listdir(tdir)):
+        tp = os.path.join(tdir, tid, "task.json")
+        if not os.path.exists(tp):
+            continue
+        t = load_json(tp)
+        rp = os.path.join(tdir, tid, "result.json")
+        t["result"] = load_json(rp) if os.path.exists(rp) else None
+        t["result_path"] = rp
+        out.append(t)
+    return out
+
+
+# ----------------------------------------------------------------------------
+# spawning worker sessions into terminal tabs
+# ----------------------------------------------------------------------------
+
+def detect_terminal(cfg):
+    forced = os.environ.get("HARNESS_TERMINAL") or cfg.get("terminal", "auto")
+    if forced and forced != "auto":
+        return forced
+    if os.environ.get("CMUX_WORKSPACE_ID") or os.environ.get("CMUX_SURFACE_ID"):
+        return "cmux"
+    if shutil.which("cmux") and cmux_socket_path():
+        return "cmux"
+    tp = os.environ.get("TERM_PROGRAM", "")
+    if tp == "ghostty":
+        return "ghostty"
+    if tp == "iTerm.app":
+        return "iterm"
+    if tp == "Apple_Terminal":
+        return "terminal"
+    if os.environ.get("TMUX"):
+        return "tmux"
+    if os.path.isdir("/Applications/Ghostty.app") or os.path.isdir(os.path.expanduser("~/Applications/Ghostty.app")):
+        return "ghostty"
+    if sys.platform == "darwin":
+        return "terminal"
+    return "bg"
+
+
+def osascript(script):
+    r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.strip() or "osascript failed")
+    return r.stdout.strip()
+
+
+def _keys_clause(keys):
+    """AppleScript for a shortcut. Prefer key codes (reliable with modifiers): t=17, [=33, ]=30."""
+    mods = ", ".join(keys.get("modifiers", []))
+    if "key_code" in keys:
+        return f'key code {int(keys["key_code"])} using {{{mods}}}' if mods else f'key code {int(keys["key_code"])}'
+    return f'keystroke "{keys["key"]}" using {{{mods}}}' if mods else f'keystroke "{keys["key"]}"'
+
+
+def cmux_socket_path():
+    """Return the cmux socket path if one exists (release builds use ~/.local/state/cmux/cmux.sock; older docs say /tmp/cmux.sock)."""
+    for cand in (os.environ.get("CMUX_SOCKET_PATH"), os.path.expanduser("~/.local/state/cmux/cmux.sock"), "/tmp/cmux.sock"):
+        if cand and os.path.exists(cand):
+            return cand
+    return None
+
+
+def cmux_bin():
+    return shutil.which("cmux") or "/Applications/cmux.app/Contents/Resources/bin/cmux"
+
+
+def cmux_run(args, timeout=20):
+    env = dict(os.environ)
+    env["CMUX_QUIET"] = "1"  # suppress alias-rename notices so stdout stays parseable
+    return subprocess.run([cmux_bin(), *args], capture_output=True, text=True, timeout=timeout, env=env)
+
+
+def cmux_notify(title, body, workspace=None):
+    """Best-effort sidebar notification in cmux (no-op if cmux is not around)."""
+    try:
+        args = ["notify", "--title", title[:80], "--body", body[:400]]
+        if workspace:
+            args += ["--workspace", workspace]
+        cmux_run(args, timeout=5)
+    except Exception:
+        pass
+
+
+def open_tab(backend, command, title, cfg, cwd=None):
+    """Run `command` (a short shell line) in a new tab/workspace of the user's terminal. Returns backend used (or info)."""
+    if backend == "cmux":
+        args = ["new-workspace", "--name", title, "--command", command,
+                "--focus", "true" if cfg.get("cmux_focus_new_workspace", False) else "false"]
+        if cwd:
+            args += ["--cwd", cwd]
+        r = cmux_run(args)
+        if r.returncode != 0:
+            raise RuntimeError((r.stderr or r.stdout).strip() or "cmux new-workspace failed")
+        ws = None
+        m = re.search(r"(workspace:\d+|[0-9a-fA-F-]{36})", r.stdout)
+        if m:
+            ws = m.group(1)
+            try:
+                cmux_run(["set-status", "harness", title, "--icon", "sparkle", "--color", "#5b8def", "--workspace", ws], timeout=5)
+            except Exception:
+                pass
+        return {"backend": "cmux", "workspace": ws, "raw": r.stdout.strip()}
+    if backend == "ghostty":
+        settle = float(cfg.get("ghostty_tab_settle_seconds", 0.8))
+        script = f'''
+tell application "Ghostty" to activate
+delay 0.3
+tell application "System Events"
+    {_keys_clause(cfg.get("ghostty_new_tab_keys", {"key": "t", "modifiers": ["command down"]}))}
+    delay {settle}
+    keystroke "{command}"
+    key code 36
+end tell
+'''
+        osascript(script)
+        if cfg.get("return_to_main_tab", True):
+            time.sleep(0.4)
+            osascript('tell application "System Events" to ' + _keys_clause(
+                cfg.get("ghostty_prev_tab_keys", {"key": "[", "modifiers": ["command down", "shift down"]})))
+        return "ghostty"
+    if backend == "iterm":
+        osascript(f'''
+tell application "iTerm"
+    tell current window
+        create tab with default profile
+        tell current session to write text "{command}"
+    end tell
+end tell''')
+        return "iterm"
+    if backend == "terminal":
+        osascript(f'tell application "Terminal" to do script "{command}"')
+        return "terminal"
+    if backend == "tmux":
+        subprocess.run(["tmux", "new-window", "-d", "-n", title[:20], command], check=True)
+        return "tmux"
+    if backend == "bg":
+        return "bg"
+    die(f"unknown terminal backend '{backend}'")
+
+
+def cmd_spawn(args):
+    cfg = config()
+    root = project_root()
+    rid = resolve_run(root, args.run)
+    rd = run_dir(root, rid)
+    run = load_json(os.path.join(rd, "run.json"))
+    td = task_dir(rd, args.task)
+    if not os.path.isdir(td):
+        die(f"task '{args.task}' not found")
+    task = load_json(os.path.join(td, "task.json"))
+    if task.get("spawned_at") and not args.force:
+        die(f"task '{args.task}' was already spawned at {task['spawned_at']} (use --force to respawn)")
+    # dependency check: all depends_on must have PASS/NOT_APPLICABLE results
+    for dep in task.get("depends_on", []):
+        rp = os.path.join(rd, "tasks", dep, "result.json")
+        if not os.path.exists(rp):
+            die(f"dependency '{dep}' has no result yet; spawn order violates required serialization")
+        st = load_json(rp).get("status")
+        if st not in ("PASS", "NOT_APPLICABLE") and not args.force:
+            die(f"dependency '{dep}' finished with status {st}; resolve it before spawning '{args.task}'")
+    rev = revision_id(root)
+    task["revision_at_spawn"] = rev
+    if not task.get("write"):
+        task["expected_revision"] = task.get("expected_revision") or rev
+
+    model = args.model or cfg.get("worker_model", "sonnet")
+    effort = args.effort or cfg.get("worker_effort", "high")
+    perm = args.permission_mode or cfg.get("worker_permission_mode", "acceptEdits")
+    name = f"{task['task_id']} {task['agent']}"
+    result_path = os.path.join(td, "result.json")
+    env = {
+        "HARNESS_HOME": HARNESS_HOME,
+        "HARNESS_RUN": rid,
+        "HARNESS_TASK": task["task_id"],
+        "HARNESS_ROLE": task["role"],
+        "HARNESS_AGENT": task["agent"],
+        "HARNESS_PRINCIPAL": task["principal_id"],
+        "HARNESS_WRITE": "1" if task.get("write") else "0",
+        "HARNESS_RESULT": result_path,
+        "HARNESS_TASK_DIR": td,
+        "HARNESS_PROJECT": root,
+        "HARNESS_RISK": run["risk"].get("level") or "unclassified",
+        "HARNESS_REVISION_AT_SPAWN": rev,
+    }
+    preamble = open(PREAMBLE_PATH, encoding="utf-8").read() if os.path.exists(PREAMBLE_PATH) else ""
+    envelope = {
+        "run_id": rid, "task_id": task["task_id"], "agent": task["agent"], "role": task["role"],
+        "principal_id": task["principal_id"], "write_allowed": bool(task.get("write")),
+        "risk_level": run["risk"].get("level"), "ai_scope": run.get("ai_scope"), "mode": run["request"].get("mode"),
+        "request_summary": run["request"].get("summary"), "acceptance_criteria": run["request"].get("acceptance_criteria"),
+        "classification": run.get("classification"), "scope": run.get("scope"), "languages": run.get("languages"),
+        "revision_at_spawn": rev, "result_path": result_path, "task_dir": td, "project_root": root,
+        "upstream_results": [os.path.join(rd, "tasks", d, "result.json") for d in task.get("depends_on", [])],
+    }
+    save_json(os.path.join(td, "envelope.json"), envelope)
+    system_append = preamble.replace("{{ENVELOPE}}", json.dumps(envelope, indent=2))
+    with open(os.path.join(td, "system-append.md"), "w", encoding="utf-8") as f:
+        f.write(system_append)
+
+    exports = "\n".join(f"export {k}={shlex.quote(v)}" for k, v in env.items())
+    claude_bin = shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
+    perm_flag = f"--permission-mode {shlex.quote(perm)}"
+    if perm == "bypassPermissions":
+        perm_flag = "--dangerously-skip-permissions"
+    launch = f"""#!/usr/bin/env bash
+# generated by harness spawn — worker session for {task['task_id']} ({task['agent']})
+set -u
+cd {shlex.quote(root)}
+{exports}
+export PATH="{os.path.join(HARNESS_HOME, 'bin')}:$HOME/.local/bin:$PATH"
+printf '\\033]0;%s\\007' {shlex.quote(name)}
+echo "harness worker: run={rid} task={task['task_id']} agent={task['agent']} role={task['role']} write={env['HARNESS_WRITE']}"
+echo "result contract: {result_path}"
+exec {shlex.quote(claude_bin)} --model {shlex.quote(model)} --effort {shlex.quote(effort)} \\
+  --agent {shlex.quote(task['agent'])} --name {shlex.quote(name)} {perm_flag} \\
+  --append-system-prompt "$(cat {shlex.quote(os.path.join(td, 'system-append.md'))})" \\
+  {'' if not args.headless else '-p --output-format text '}"$(cat {shlex.quote(os.path.join(td, 'package.md'))})"
+"""
+    os.makedirs(LAUNCH_DIR, exist_ok=True)
+    launch_path = os.path.join(LAUNCH_DIR, f"{rid}-{task['task_id']}.sh")
+    with open(launch_path, "w", encoding="utf-8") as f:
+        f.write(launch)
+    os.chmod(launch_path, 0o755)
+    shutil.copy(launch_path, os.path.join(td, "launch.sh"))
+
+    backend = args.terminal or detect_terminal(cfg)
+    if args.headless:
+        backend = "bg"
+    command = f"bash {launch_path}"
+    if args.dry_run:
+        print(json.dumps({"dry_run": True, "backend": backend, "command": command, "launch_script": launch_path,
+                          "model": model, "effort": effort, "permission_mode": perm}, indent=2))
+        return
+    try:
+        used = open_tab(backend, command, name, cfg, cwd=root)
+    except Exception as e:
+        if backend == "cmux":
+            die(f"cmux could not open a workspace ({e}). Is cmux running and is this session inside cmux? "
+                f"Fallback: harness spawn --terminal bg  (or --terminal ghostty/iterm/terminal)")
+        raise
+    ws_ref = None
+    if isinstance(used, dict):
+        ws_ref = used.get("workspace")
+        used = used["backend"]
+    if used == "bg":
+        log = os.path.join(td, "worker.log")
+        with open(log, "ab") as lf:
+            subprocess.Popen(["bash", launch_path], stdout=lf, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                             cwd=root, start_new_session=True)
+    task["spawned_at"] = now_iso()
+    task["spawn_backend"] = used
+    task["cmux_workspace"] = ws_ref
+    task["model"] = model
+    task["effort"] = effort
+    save_json(os.path.join(td, "task.json"), task)
+    audit(root, rid, "TASK_SPAWNED", {"task_id": task["task_id"], "agent": task["agent"], "role": task["role"],
+                                      "backend": used, "model": model, "effort": effort, "revision": rev})
+    print(json.dumps({"spawned": task["task_id"], "agent": task["agent"], "backend": used, "cmux_workspace": ws_ref, "model": model,
+                      "effort": effort, "revision_at_spawn": rev, "result_path": result_path,
+                      "wait": f"harness wait --run {rid} --task {task['task_id']}  (run this in the background)"}, indent=2))
+
+
+# ----------------------------------------------------------------------------
+# results, waiting, status
+# ----------------------------------------------------------------------------
+
+def validate_result(res, schema=None):
+    """Hand-rolled structural validation (no third-party deps). Returns list of problems."""
+    schema = schema or load_json(SCHEMA_PATH)
+    problems = []
+    for key in schema["required"]:
+        if key not in res:
+            problems.append(f"missing required field '{key}'")
+    enums = schema.get("enums", {})
+    if "status" in res and res["status"] not in enums["status"]:
+        problems.append(f"status must be one of {enums['status']}")
+    if res.get("status") == "NOT_APPLICABLE" and not res.get("not_applicable_reason"):
+        problems.append("NOT_APPLICABLE requires not_applicable_reason")
+    for f in res.get("findings", []) or []:
+        for k in ("id", "severity", "description", "blocking", "status"):
+            if k not in f:
+                problems.append(f"finding missing '{k}'")
+        if f.get("severity") not in enums["severity"]:
+            problems.append(f"finding {f.get('id')} severity must be one of {enums['severity']}")
+        if f.get("status") not in enums["finding_status"]:
+            problems.append(f"finding {f.get('id')} status must be one of {enums['finding_status']}")
+    ev_ids = {e.get("id") for e in res.get("evidence", []) or []}
+    for e in res.get("evidence", []) or []:
+        for k in ("id", "type", "summary"):
+            if k not in e:
+                problems.append(f"evidence missing '{k}'")
+        if e.get("type") not in enums["evidence_type"]:
+            problems.append(f"evidence {e.get('id')} type must be one of {enums['evidence_type']}")
+        if e.get("type") == "command" and ("command" not in e or "exit_code" not in e):
+            problems.append(f"command evidence {e.get('id')} needs 'command' and 'exit_code'")
+    for c in res.get("claims", []) or []:
+        if not c.get("evidence_refs"):
+            problems.append(f"claim '{c.get('statement','')[:40]}' has no evidence_refs")
+        for ref in c.get("evidence_refs", []):
+            if ref not in ev_ids:
+                problems.append(f"claim references unknown evidence id '{ref}'")
+    tests = res.get("tests") or {}
+    if res.get("status") == "PASS" and tests.get("failed"):
+        problems.append("status PASS but tests.failed is non-empty (evidence contradicts status)")
+    if res.get("status") == "PASS" and any(f.get("blocking") and f.get("status") == "open" for f in res.get("findings", []) or []):
+        problems.append("status PASS but an open blocking finding exists")
+    if not str(res.get("revision", "")).startswith(("git:", "tree:")):
+        problems.append("revision must come from `harness rev`")
+    if os.environ.get("HARNESS_WRITE") == "0" and res.get("files_changed"):
+        problems.append("read-only role: files_changed must be [] (you did not modify files; list what you inspected in scope_examined instead)")
+    if "summary" not in res or not res.get("summary"):
+        problems.append("summary (<=400 chars, for the orchestrator) is required")
+    return problems
+
+
+def cmd_result_validate(args):
+    path = args.path or os.environ.get("HARNESS_RESULT")
+    if not path:
+        die("give a result path or run inside a worker (HARNESS_RESULT set)")
+    try:
+        res = load_json(path)
+    except FileNotFoundError:
+        die(f"result file not found: {path}")
+    except json.JSONDecodeError as e:
+        die(f"result is not valid JSON: {e}")
+    problems = validate_result(res)
+    root = project_root(os.path.dirname(path))
+    cur = revision_id(root)
+    if res.get("revision") != cur:
+        problems.append(f"revision {res.get('revision')} != current working tree {cur} "
+                        f"(re-run `harness rev` after your last change and update the result)")
+    if problems:
+        print(json.dumps({"valid": False, "problems": problems}, indent=2))
+        sys.exit(1)
+    print(json.dumps({"valid": True, "path": path, "status": res.get("status")}, indent=2))
+
+
+def cmd_result_template(args):
+    env = {k: os.environ.get(k) for k in ("HARNESS_RUN", "HARNESS_TASK", "HARNESS_AGENT", "HARNESS_ROLE", "HARNESS_PRINCIPAL", "HARNESS_RISK")}
+    root = project_root()
+    tpl = {
+        "schema_version": "harness-result/1",
+        "run_id": args.run or env["HARNESS_RUN"], "task_id": args.task or env["HARNESS_TASK"],
+        "agent": env["HARNESS_AGENT"], "role": env["HARNESS_ROLE"], "principal_id": env["HARNESS_PRINCIPAL"],
+        "model": config().get("worker_model", "sonnet"), "created_at": now_iso(),
+        "status": "PASS | FAIL | BLOCKED | NOT_APPLICABLE | NEEDS_REVIEW",
+        "risk_level": env["HARNESS_RISK"],
+        "revision": revision_id(root),
+        "scope_examined": [], "actions": [],
+        "files_changed": changed_files(root) if os.environ.get("HARNESS_WRITE") == "1" else [],
+        "evidence": [{"id": "E1", "type": "command", "command": "<exact command>", "cwd": ".", "exit_code": 0,
+                      "summary": "<what it showed>", "artifact": "<path under task dir, optional>"}],
+        "findings": [],
+        "tests": {"executed": [], "passed": [], "failed": []},
+        "claims": [{"statement": "<material claim>", "evidence_refs": ["E1"]}],
+        "packs_loaded": [], "requirements_covered": [],
+        "unresolved": [], "residual_risks": [],
+        "handoff": {"next_agent": None, "reason": None},
+        "not_applicable_reason": None,
+        "summary": "<3-6 lines for the orchestrator: verdict, key findings, what was executed>",
+    }
+    print(json.dumps(tpl, indent=2))
+
+
+def cmd_rev(args):
+    print(revision_id(project_root()))
+
+
+def cmd_envelope(args):
+    td = os.environ.get("HARNESS_TASK_DIR")
+    if not td:
+        die("not inside a worker session (HARNESS_TASK_DIR unset)")
+    print(open(os.path.join(td, "envelope.json"), encoding="utf-8").read())
+
+
+def summarize_result(t):
+    r = t.get("result")
+    if not r:
+        return f"{t['task_id']:<18} {t['role']:<22} PENDING"
+    fnd = r.get("findings") or []
+    open_by_sev = {}
+    for f in fnd:
+        if f.get("status") == "open":
+            open_by_sev[f["severity"]] = open_by_sev.get(f["severity"], 0) + 1
+    tests = r.get("tests") or {}
+    return (f"{t['task_id']:<18} {t['role']:<22} {r.get('status'):<15} rev={str(r.get('revision'))[:24]} "
+            f"open_findings={open_by_sev or 0} tests(p/f)={len(tests.get('passed', []))}/{len(tests.get('failed', []))} "
+            f"files_changed={len(r.get('files_changed') or [])}")
+
+
+def cmd_wait(args):
+    root = project_root()
+    rid = resolve_run(root, args.run)
+    rd = run_dir(root, rid)
+    want = args.task or [t["task_id"] for t in _tasks(rd) if t.get("spawned_at") and not t.get("result")]
+    if not want:
+        print("nothing to wait for")
+        return
+    deadline = time.time() + args.timeout
+    done = {}
+    while time.time() < deadline:
+        for tid in want:
+            if tid in done:
+                continue
+            rp = os.path.join(rd, "tasks", tid, "result.json")
+            if os.path.exists(rp):
+                try:
+                    res = load_json(rp)
+                except json.JSONDecodeError:
+                    continue  # being written
+                problems = validate_result(res)
+                if problems and time.time() < deadline - args.interval:
+                    continue  # worker is still being held by the Stop hook until the record validates
+                done[tid] = {"status": res.get("status"), "valid": not problems, "problems": problems,
+                             "summary": (res.get("summary") or "")[:400],
+                             "open_findings": [f for f in res.get("findings", []) if f.get("status") == "open"],
+                             "handoff": res.get("handoff"), "unresolved": res.get("unresolved"), "result_path": rp}
+        if len(done) == len(want):
+            break
+        time.sleep(args.interval)
+    pending = [t for t in want if t not in done]
+    out = {"run_id": rid, "completed": done, "pending": pending}
+    if pending:
+        out["note"] = "timeout reached; workers still running (check their tabs)"
+    print(json.dumps(out, indent=2))
+    if pending:
+        sys.exit(124)
+
+
+def cmd_status(args):
+    root = project_root()
+    rid = resolve_run(root, args.run)
+    rd = run_dir(root, rid)
+    run = load_json(os.path.join(rd, "run.json"))
+    print(f"run {rid}  risk={run['risk'].get('level')}  mode={run['request'].get('mode')}  workflow={run['workflow'].get('model')}  "
+          f"state={run['status'].get('state')}  cycles={run.get('remediation_cycles')}")
+    print(f"request: {run['request'].get('summary','')[:120]}")
+    print(f"revision now: {revision_id(root)}   baseline: {run['repository'].get('baseline_revision')}")
+    print("-" * 110)
+    for t in _tasks(rd):
+        print(summarize_result(t))
+    gp = os.path.join(rd, "gate.json")
+    if os.path.exists(gp):
+        g = load_json(gp)
+        print("-" * 110)
+        print(f"last gate: {g['gate_result']} ({g.get('pass_mode')})  reasons={g.get('reason_codes')}")
+
+
+# ----------------------------------------------------------------------------
+# practice packs
+# ----------------------------------------------------------------------------
+
+def _front_matter(path):
+    text = open(path, encoding="utf-8").read()
+    if not text.startswith("---"):
+        return {}, text
+    end = text.find("\n---", 3)
+    fm_text = text[3:end].strip()
+    body = text[end + 4:]
+    fm = {}
+    cur_key = None
+    for line in fm_text.splitlines():
+        if not line.strip():
+            continue
+        if line.startswith("  - ") and cur_key:
+            fm.setdefault(cur_key, [])
+            if isinstance(fm[cur_key], list):
+                fm[cur_key].append(line[4:].strip().strip('"'))
+            continue
+        if ":" in line and not line.startswith(" "):
+            k, v = line.split(":", 1)
+            cur_key = k.strip()
+            v = v.strip()
+            if v == "":
+                fm[cur_key] = []
+            elif v.startswith("[") and v.endswith("]"):
+                fm[cur_key] = [x.strip().strip('"').strip("'") for x in v[1:-1].split(",") if x.strip()]
+            else:
+                fm[cur_key] = v.strip('"')
+    return fm, body
+
+
+def all_packs():
+    packs = []
+    for dirpath, _, files in os.walk(PACKS_DIR):
+        for fn in files:
+            if fn.endswith(".md") and fn != "README.md":
+                p = os.path.join(dirpath, fn)
+                fm, _ = _front_matter(p)
+                if fm.get("id"):
+                    fm["path"] = p
+                    packs.append(fm)
+    return sorted(packs, key=lambda x: (x.get("priority", "z"), x["id"]))
+
+
+def applicable_packs(run, agent):
+    ctx = set()
+    cls = run.get("classification", {})
+    ctx.add("always")
+    for ct in [cls.get("primary_change_type")] + list(cls.get("secondary_change_types") or []):
+        if ct:
+            ctx.add(f"change_type:{ct}")
+    for flag in ("externally_exposed", "security_boundary_affected", "privilege_boundary_affected", "persistent_data_affected",
+                 "third_party_code_added", "build_or_release_path_affected", "untrusted_input_affected", "irreversible_effect_possible"):
+        if cls.get(flag):
+            ctx.add(f"flag:{flag}")
+    if run.get("ai_scope") and run["ai_scope"] != "none":
+        ctx.add("ai")
+        ctx.add(f"ai_scope:{run['ai_scope']}")
+    for lang in run.get("languages") or []:
+        ctx.add(f"lang:{lang.lower()}")
+    if run["request"].get("mode") == "VULNERABILITY_RESPONSE":
+        ctx.add("mode:vulnerability_response")
+    if run["request"].get("mode") == "RELEASE":
+        ctx.add("mode:release")
+    if run["risk"].get("level"):
+        ctx.add(f"risk:{run['risk']['level']}")
+        for lvl in ("R0", "R1", "R2", "R3"):
+            if RISK_ORDER[lvl] <= RISK_ORDER[run["risk"]["level"]]:
+                ctx.add(f"risk_at_least:{lvl}")
+    out = []
+    for p in all_packs():
+        agents = p.get("agents") or []
+        if agents and agent not in agents and "*" not in agents:
+            continue
+        conds = p.get("applies_when") or ["always"]
+        if isinstance(conds, str):
+            conds = [conds]
+        if any(c in ctx for c in conds):
+            out.append(p)
+    # project-local pack overlay
+    proj = os.path.join(run.get("project_root", "."), ".harness", "policy", "project-pack.md")
+    if os.path.exists(proj):
+        fm, _ = _front_matter(proj)
+        fm = fm or {"id": "project.policy"}
+        fm["path"] = proj
+        fm["priority"] = "1-project"
+        out.insert(0, fm)
+    return out, sorted(ctx)
+
+
+def cmd_packs(args):
+    root = project_root()
+    if args.list:
+        for p in all_packs():
+            print(f"{p['id']:<34} v{p.get('version','?'):<12} {p.get('priority','?'):<22} {p['path']}")
+        return
+    rid = resolve_run(root, args.run)
+    run = load_json(os.path.join(run_dir(root, rid), "run.json"))
+    agent = args.agent or os.environ.get("HARNESS_AGENT")
+    if not agent:
+        die("--agent required (or run inside a worker)")
+    packs, ctx = applicable_packs(run, agent)
+    print(json.dumps({"agent": agent, "context": ctx,
+                      "packs": [{"id": p["id"], "version": p.get("version"), "priority": p.get("priority"), "path": p["path"]} for p in packs],
+                      "instruction": "Read each pack file. Apply MUST rules; record requirement IDs you verified in result.packs_loaded / requirements_covered."}, indent=2))
+
+
+# ----------------------------------------------------------------------------
+# built-in deterministic scanners (machine evidence without external tools)
+# ----------------------------------------------------------------------------
+
+SECRET_PATTERNS = [
+    ("aws_access_key", r"AKIA[0-9A-Z]{16}"),
+    ("aws_secret_key", r"(?i)aws(.{0,20})?(secret|private)?(.{0,20})?['\"][0-9a-zA-Z/+]{40}['\"]"),
+    ("private_key_block", r"-----BEGIN (RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY"),
+    ("github_token", r"gh[pousr]_[A-Za-z0-9]{36,}"),
+    ("slack_token", r"xox[baprs]-[0-9A-Za-z-]{10,}"),
+    ("anthropic_key", r"sk-ant-[A-Za-z0-9_-]{20,}"),
+    ("openai_key", r"sk-[A-Za-z0-9]{32,}"),
+    ("google_api_key", r"AIza[0-9A-Za-z_-]{35}"),
+    ("stripe_key", r"(sk|rk)_(live|test)_[0-9a-zA-Z]{20,}"),
+    ("jwt", r"eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"),
+    ("generic_password_assignment", r"(?i)(password|passwd|pwd|secret|api[_-]?key|token)\s*[:=]\s*['\"][^'\"\s]{8,}['\"]"),
+    ("connection_string_with_password", r"(?i)(postgres|mysql|mongodb|redis|amqp)://[^:\s]+:[^@\s]+@"),
+]
+
+
+def scan_secrets(root, paths=None):
+    findings = []
+    if paths is None:
+        paths = changed_files(root) if is_git(root) else []
+        if not paths and is_git(root):
+            paths = []
+    scanned = 0
+    for rel in paths:
+        p = os.path.join(root, rel)
+        if not os.path.isfile(p) or os.path.getsize(p) > 2_000_000:
+            continue
+        try:
+            text = open(p, encoding="utf-8", errors="replace").read()
+        except OSError:
+            continue
+        scanned += 1
+        for i, line in enumerate(text.splitlines(), 1):
+            for name, rx in SECRET_PATTERNS:
+                if re.search(rx, line):
+                    if re.search(r"(?i)(example|placeholder|dummy|changeme|your[_-]?|<[^>]+>|xxxx|\$\{|process\.env|os\.environ|getenv)", line):
+                        continue
+                    findings.append({"pattern": name, "path": rel, "line": i, "redacted": re.sub(r"[A-Za-z0-9/+_-]{8,}", "****", line.strip())[:160]})
+    return {"scanner": "harness.secrets", "version": "1", "files_scanned": scanned, "paths": paths, "findings": findings,
+            "status": "fail" if findings else ("pass" if scanned else "inconclusive"),
+            "note": "Regex heuristic scanner. A pass is evidence that no known secret pattern appears in the scanned files, not proof of absence."}
+
+
+def cmd_scan(args):
+    root = project_root()
+    if args.kind == "secrets":
+        paths = args.paths or None
+        if args.all and is_git(root):
+            paths = [l for l in git(root, "ls-files").stdout.splitlines() if l and not l.startswith(".harness")]
+        res = scan_secrets(root, paths)
+        print(json.dumps(res, indent=2))
+        sys.exit(0 if res["status"] == "pass" else 1)
+    if args.kind == "deps":
+        res = dependency_diff(root)
+        print(json.dumps(res, indent=2))
+        return
+    die("unknown scan kind")
+
+
+MANIFESTS = ["package.json", "requirements.txt", "requirements-dev.txt", "pyproject.toml", "Pipfile", "go.mod", "Cargo.toml",
+             "Gemfile", "pom.xml", "build.gradle", "build.gradle.kts", "composer.json"]
+LOCKS = ["package-lock.json", "yarn.lock", "pnpm-lock.yaml", "poetry.lock", "Pipfile.lock", "go.sum", "Cargo.lock", "Gemfile.lock", "composer.lock", "uv.lock"]
+
+
+def dependency_diff(root):
+    """Which manifests/locks changed vs HEAD, and a rough list of added dependency lines."""
+    if not is_git(root):
+        return {"is_git": False, "changed_manifests": [], "added_lines": [], "status": "inconclusive"}
+    changed = changed_files(root)
+    man = [c for c in changed if os.path.basename(c) in MANIFESTS]
+    lock = [c for c in changed if os.path.basename(c) in LOCKS]
+    added = []
+    for c in man:
+        diff = git(root, "diff", "HEAD", "--", c).stdout
+        for line in diff.splitlines():
+            if line.startswith("+") and not line.startswith("+++"):
+                l = line[1:].strip()
+                if re.search(r"[\"']?[A-Za-z0-9@/._-]+[\"']?\s*[:=]\s*[\"']?[\^~>=<]?\d|^[A-Za-z0-9._-]+\s*[=<>~]{1,2}\s*[\d.]+|require\s+\S+\s+v?\d|^\s*\S+\s+v\d", l):
+                    added.append({"manifest": c, "line": l[:160]})
+    status = "changed" if (man or lock) else "unchanged"
+    return {"is_git": True, "changed_manifests": man, "changed_locks": lock, "added_lines": added, "status": status,
+            "lock_without_manifest": bool(lock and not man), "manifest_without_lock": bool(man and not lock)}
+
+
+# ----------------------------------------------------------------------------
+# waivers, approvals
+# ----------------------------------------------------------------------------
+
+def cmd_waiver(args):
+    root = project_root()
+    rid = resolve_run(root, args.run)
+    rd = run_dir(root, rid)
+    if not args.approved_by.startswith("human:"):
+        die("waivers must be approved by a human principal, e.g. --approved-by human:<name>")
+    if os.environ.get("HARNESS_ROLE"):
+        die("a worker session cannot create waivers")
+    wid = "W-" + uuid.uuid4().hex[:8]
+    w = {"waiver_id": wid, "run_id": rid, "revision_id": revision_id(root), "finding_ids": args.finding,
+         "policy_rule_ids": args.rule or [], "reason": args.reason, "compensating_controls": args.control or [],
+         "approved_by": {"principal_id": args.approved_by, "role": args.role or "repository_owner"},
+         "issued_at": now_iso(), "expires_at": args.expires, "status": "active"}
+    save_json(os.path.join(rd, "waivers", wid + ".json"), w)
+    audit(root, rid, "WAIVER_ISSUED", w, actor=args.approved_by)
+    print(json.dumps(w, indent=2))
+
+
+def cmd_approve(args):
+    root = project_root()
+    rid = resolve_run(root, args.run)
+    rd = run_dir(root, rid)
+    if not args.by.startswith("human:"):
+        die("human approval must be given by a human principal, e.g. --by human:<name>")
+    if os.environ.get("HARNESS_ROLE"):
+        die("a worker session cannot record human approval")
+    a = {"approval_id": "A-" + uuid.uuid4().hex[:8], "run_id": rid, "revision_id": revision_id(root),
+         "approved_by": {"principal_id": args.by, "role": args.role or "release_authority"},
+         "scope": args.scope or "release", "note": args.note or "", "issued_at": now_iso()}
+    save_json(os.path.join(rd, "approvals", a["approval_id"] + ".json"), a)
+    audit(root, rid, "HUMAN_APPROVAL", a, actor=args.by)
+    print(json.dumps(a, indent=2))
+
+
+# ----------------------------------------------------------------------------
+# the policy gate
+# ----------------------------------------------------------------------------
+
+def effective_results(rd):
+    """Latest valid result per task; later retries supersede the task they retry."""
+    tasks = _tasks(rd)
+    superseded = {t["retry_of"] for t in tasks if t.get("retry_of") and t.get("result")}
+    eff = [t for t in tasks if t.get("result") and t["task_id"] not in superseded]
+    return eff, tasks
+
+
+def evaluate_gate(root, rid, policy=None):
+    cfg = config()
+    policy = policy or load_json(POLICY_PATH)
+    rd = run_dir(root, rid)
+    run = load_json(os.path.join(rd, "run.json"))
+    cur_rev = revision_id(root)
+    eff, all_tasks = effective_results(rd)
+    reasons, blocking, missing, inconclusive, waived, routes, notes = [], [], [], [], [], [], []
+    na = []
+    schema = load_json(SCHEMA_PATH)
+
+    risk = run["risk"].get("level")
+    mode = run["request"].get("mode") or "CHANGE"
+    cls = run.get("classification", {})
+    ai = (run.get("ai_scope") or "none") != "none"
+
+    if mode == "READ_ONLY":
+        return {"gate_result": "NOT_APPLICABLE", "reason_codes": ["READ_ONLY_REQUEST"], "applicability": "mode == READ_ONLY"}
+
+    if not risk:
+        return _gate_result(root, rd, run, cur_rev, "FAIL", ["RISK_NOT_CLASSIFIED"], ["risk.level"], [], [], [],
+                            [{"route_to": "orchestrator", "reason": "classify risk before gating"}], [], [], policy)
+
+    # --- invalid results are treated as missing/inconclusive, never as pass
+    by_role = {}
+    invalid = []
+    for t in eff:
+        problems = validate_result(t["result"], schema)
+        if problems:
+            invalid.append({"task_id": t["task_id"], "problems": problems})
+            continue
+        by_role.setdefault(t["role"], []).append(t)
+    for inv in invalid:
+        inconclusive.append(f"result:{inv['task_id']}")
+        reasons.append("INVALID_RESULT_RECORD")
+        routes.append({"route_to": inv["task_id"], "reason": "result record failed schema validation", "problems": inv["problems"]})
+
+    def passed(role):
+        return [t for t in by_role.get(role, []) if t["result"]["status"] == "PASS"]
+
+    def latest(role):
+        ts = by_role.get(role, [])
+        return sorted(ts, key=lambda t: t["result"].get("created_at", ""))[-1] if ts else None
+
+    # --- required roles for this risk level and mode
+    prof = policy["risk_profiles"][risk]
+    required_roles = list(prof["required_roles"])
+    conditional = prof.get("conditional_roles", {})
+    triggers = {
+        "third_party_code_added": bool(cls.get("third_party_code_added")),
+        "persistent_data_affected": bool(cls.get("persistent_data_affected")),
+        "build_or_release_path_affected": bool(cls.get("build_or_release_path_affected")),
+        "ai_scope": ai,
+        "externally_exposed": bool(cls.get("externally_exposed")),
+        "security_boundary_affected": bool(cls.get("security_boundary_affected")),
+        "privilege_boundary_affected": bool(cls.get("privilege_boundary_affected")),
+    }
+    for role, cond in conditional.items():
+        if triggers.get(cond):
+            required_roles.append(role)
+    if mode == "VULNERABILITY_RESPONSE":
+        required_roles += policy["vulnerability_response_roles"]
+        if RISK_ORDER[risk] >= 2:
+            required_roles += ["root-cause", "regression-prevention"]
+        required_roles = [r for r in required_roles if r != "implementer"] if "remediation" in required_roles else required_roles
+    required_roles = list(dict.fromkeys(required_roles))
+    applicable_rules = [{"rule_id": f"role.{r}", "required": True} for r in required_roles]
+
+    impl_role = "remediation" if mode == "VULNERABILITY_RESPONSE" and by_role.get("remediation") else "implementer"
+    impl = latest(impl_role)
+    impl_principal = impl["result"].get("principal_id") if impl else None
+    if impl is None and risk == "R0" and run.get("orchestrator_implemented"):
+        impl_principal = cfg.get("orchestrator_principal", "orchestrator")
+        notes.append("R0: orchestrator implemented directly (permitted by policy for non-executable changes)")
+
+    for role in required_roles:
+        if role == impl_role and impl is None and impl_principal:
+            continue  # R0 orchestrator implementation
+        ts = by_role.get(role, [])
+        if not ts:
+            if role in run.get("not_applicable", {}):
+                na.append({"role": role, "reason": run["not_applicable"][role]})
+                if role in policy["never_not_applicable"]:
+                    reasons.append("NOT_APPLICABLE_MISUSED")
+                    blocking.append(f"role.{role}")
+                    routes.append({"route_to": "orchestrator", "reason": f"role '{role}' cannot be marked not_applicable at {risk}"})
+                continue
+            missing.append(f"role.{role}")
+            on_missing = policy.get("on_missing", {}).get(role, "FAIL")
+            reasons.append(f"MISSING_{role.upper().replace('-', '_')}")
+            routes.append({"route_to": role, "reason": f"required role '{role}' produced no result", "on_missing": on_missing})
+            continue
+        lt = latest(role)
+        st = lt["result"]["status"]
+        if st == "PASS":
+            continue
+        if st == "NOT_APPLICABLE":
+            na.append({"role": role, "reason": lt["result"].get("not_applicable_reason"), "task": lt["task_id"]})
+            if role in policy["never_not_applicable"]:
+                reasons.append("NOT_APPLICABLE_MISUSED")
+                blocking.append(f"role.{role}")
+            continue
+        if st in ("FAIL", "BLOCKED"):
+            blocking.append(f"role.{role}")
+            reasons.append(f"{role.upper().replace('-', '_')}_{st}")
+            routes.append({"route_to": policy["remediation_routes"].get(role, "implementer"), "reason": f"{role} result is {st}",
+                           "task": lt["task_id"], "findings": [f["id"] for f in lt["result"].get("findings", []) if f.get("blocking")]})
+        if st == "NEEDS_REVIEW":
+            inconclusive.append(f"role.{role}")
+            reasons.append(f"{role.upper().replace('-', '_')}_NEEDS_REVIEW")
+
+    # --- process-integrity invariants (non-overridable)
+    # SoD applies to every independent role; revision freshness applies only to roles that evaluate the
+    # final implementation. Design-time roles (architecture-review) bind to the design, dependency-review
+    # binds to the manifest/lock digest (checked below), not to the final tree.
+    sod_roles = [r for r in ("code-review", "security-review", "test-verification", "security-testing", "ai-adversarial-testing",
+                             "architecture-review", "dependency-review", "release-integrity", "build-security", "secure-defaults") if r in required_roles]
+    fresh_roles = {"code-review", "security-review", "test-verification", "security-testing", "ai-adversarial-testing",
+                   "release-integrity", "build-security", "secure-defaults"}
+    for role in sod_roles:
+        lt = latest(role)
+        if not lt:
+            continue
+        rp = lt["result"].get("principal_id")
+        if impl_principal and rp == impl_principal:
+            blocking.append(f"sod.{role}")
+            reasons.append("AUTHOR_IS_REVIEWER")
+            routes.append({"route_to": "orchestrator", "reason": f"{role} principal equals implementer principal {rp}"})
+        if lt["result"].get("files_changed"):
+            blocking.append(f"readonly.{role}")
+            reasons.append("REVIEWER_MODIFIED_FILES")
+            routes.append({"route_to": "orchestrator", "reason": f"{role} task {lt['task_id']} reports files_changed; reviewers must be read-only"})
+        if role in fresh_roles and lt["result"].get("revision") != cur_rev:
+            blocking.append(f"stale.{role}")
+            reasons.append("STALE_REVIEW_EVIDENCE")
+            routes.append({"route_to": role, "reason": f"{role} evidence bound to {lt['result'].get('revision')} but working tree is {cur_rev}; re-run against final revision"})
+    cr, sr, stt = latest("code-review"), latest("security-review"), latest("security-testing")
+    if RISK_ORDER[risk] >= 3 and cr and sr and cr["result"].get("principal_id") == sr["result"].get("principal_id"):
+        blocking.append("sod.security-review-distinct")
+        reasons.append("SECURITY_REVIEW_NOT_INDEPENDENT")
+    if cr and stt and cr["result"].get("principal_id") == stt["result"].get("principal_id"):
+        blocking.append("sod.review-vs-testing")
+        reasons.append("CODE_REVIEW_AND_SECURITY_TESTING_SAME_PRINCIPAL")
+    if impl and impl["result"].get("revision") != cur_rev:
+        blocking.append("revision.implementer")
+        reasons.append("UNEXPLAINED_CHANGES_AFTER_IMPLEMENTATION")
+        routes.append({"route_to": "orchestrator", "reason": f"implementer recorded {impl['result'].get('revision')}, tree is now {cur_rev}"})
+    # R3 ordering: architecture review must precede implementation
+    if RISK_ORDER[risk] >= 3 and impl and latest("architecture-review"):
+        ar = latest("architecture-review")
+        if ar["result"].get("created_at", "") > (impl.get("spawned_at") or impl["result"].get("created_at", "")):
+            blocking.append("order.architecture-before-implementation")
+            reasons.append("IMPLEMENTATION_BEFORE_ARCHITECTURE_APPROVAL")
+
+    # R0 executable-file check
+    if risk == "R0":
+        files = changed_files(root) if is_git(root) else (impl["result"].get("files_changed") if impl else [])
+        pre = set(run["repository"].get("preexisting_changes") or [])
+        bad = [f for f in files if f not in pre and not re.search(r"\.(md|mdx|rst|txt|adoc)$|(^|/)docs?/|(^|/)LICENSE|(^|/)CHANGELOG", f, re.I)]
+        if bad:
+            blocking.append("r0.non_doc_files_changed")
+            reasons.append("R0_EXECUTABLE_FILE_CHANGED")
+            routes.append({"route_to": "orchestrator", "reason": f"R0 change touched non-documentation files {bad}; reclassify at least R1"})
+
+    # --- findings across all effective results, with waivers
+    waivers = [load_json(os.path.join(rd, "waivers", w)) for w in sorted(os.listdir(os.path.join(rd, "waivers")))] if os.path.isdir(os.path.join(rd, "waivers")) else []
+    valid_waivers = {}
+    for w in waivers:
+        ok = w.get("status") == "active" and str(w.get("approved_by", {}).get("principal_id", "")).startswith("human:")
+        if w.get("expires_at") and w["expires_at"] < now_iso():
+            ok = False
+        if w.get("revision_id") != cur_rev:
+            ok = False
+        if ok:
+            for fid in w.get("finding_ids", []):
+                valid_waivers[fid] = w["waiver_id"]
+    open_findings = []
+    for t in eff:
+        for f in t["result"].get("findings", []) or []:
+            if f.get("status") == "open":
+                ff = dict(f)
+                ff["task_id"] = t["task_id"]
+                open_findings.append(ff)
+    thresholds = policy["finding_thresholds"][risk]
+    for f in open_findings:
+        sev = f["severity"]
+        if sev == "critical":
+            blocking.append(f"finding.{f['id']}")
+            reasons.append("CRITICAL_FINDING_OPEN")
+            routes.append({"route_to": policy["remediation_routes"].get("finding", "implementer"), "finding": f["id"], "task": f["task_id"], "reason": f["description"][:200]})
+        elif sev in thresholds["blocking"]:
+            if f["id"] in valid_waivers:
+                waived.append(f["id"])
+            else:
+                blocking.append(f"finding.{f['id']}")
+                reasons.append(f"{sev.upper()}_FINDING_OPEN")
+                routes.append({"route_to": policy["remediation_routes"].get("finding", "implementer"), "finding": f["id"], "task": f["task_id"], "reason": f["description"][:200]})
+        elif f.get("blocking"):
+            blocking.append(f"finding.{f['id']}")
+            reasons.append("BLOCKING_FINDING_OPEN")
+            routes.append({"route_to": policy["remediation_routes"].get("finding", "implementer"), "finding": f["id"], "task": f["task_id"], "reason": f["description"][:200]})
+
+    # --- test failures in any effective result
+    for t in eff:
+        if (t["result"].get("tests") or {}).get("failed"):
+            blocking.append(f"tests.{t['task_id']}")
+            reasons.append("REQUIRED_TEST_FAILED")
+            routes.append({"route_to": "implementer", "task": t["task_id"], "reason": f"failed tests: {t['result']['tests']['failed'][:5]}"})
+
+    # --- secrets scan evidence for R2+
+    if RISK_ORDER[risk] >= 2:
+        has_secrets_scan = any(e.get("type") == "secrets-scan" and e.get("status", "pass") == "pass"
+                               for t in eff for e in t["result"].get("evidence", []) or [])
+        if not has_secrets_scan:
+            live = scan_secrets(root)
+            if live["status"] == "fail":
+                blocking.append("secrets.scan")
+                reasons.append("SECRET_PATTERN_DETECTED")
+                routes.append({"route_to": "implementer", "reason": "harness scan secrets found secret-like content", "findings": live["findings"]})
+            elif live["status"] == "pass":
+                notes.append("secrets scan executed by gate (no worker recorded one)")
+            else:
+                missing.append("evidence.secrets-scan")
+                reasons.append("MISSING_SECRETS_SCAN")
+
+    # --- dependency review must cover manifests if they changed
+    if triggers["third_party_code_added"] or (is_git(root) and dependency_diff(root)["status"] == "changed"):
+        if not passed("dependency-review") and "dependency-review" not in run.get("not_applicable", {}):
+            if "role.dependency-review" not in missing and "role.dependency-review" not in blocking:
+                missing.append("role.dependency-review")
+                reasons.append("DEPENDENCY_MANIFEST_CHANGED_WITHOUT_REVIEW")
+                routes.append({"route_to": "dependency-review", "reason": "dependency manifests/locks changed"})
+
+    # --- human approval for R3
+    if RISK_ORDER[risk] >= 3 and cfg.get("r3_requires_human_approval", True):
+        apps = [load_json(os.path.join(rd, "approvals", a)) for a in sorted(os.listdir(os.path.join(rd, "approvals")))] if os.path.isdir(os.path.join(rd, "approvals")) else []
+        ok = [a for a in apps if str(a.get("approved_by", {}).get("principal_id", "")).startswith("human:") and a.get("revision_id") == cur_rev]
+        if not ok:
+            inconclusive.append("human.release_approval")
+            reasons.append("HUMAN_APPROVAL_REQUIRED")
+
+    # --- repeated failure escalation
+    if blocking and run.get("remediation_cycles", 0) >= cfg.get("max_remediation_cycles", 2):
+        reasons.append("BLOCKED_REPEATED_FAILURE")
+        inconclusive.append("retry.limit")
+
+    # --- terminal decision
+    reasons = list(dict.fromkeys(reasons))
+    if blocking:
+        result = "FAIL"
+    elif any(policy.get("on_missing", {}).get(m.split(".", 1)[-1], "FAIL") == "FAIL" for m in missing):
+        result = "FAIL"
+    elif missing or inconclusive:
+        result = "NEEDS_HUMAN"
+    elif not applicable_rules:
+        result = "NOT_APPLICABLE"
+    else:
+        result = "PASS"
+        reasons.append("ALL_MANDATORY_REQUIREMENTS_SATISFIED")
+        if waived:
+            reasons.append("AUTHORIZED_WAIVER_APPLIED")
+    return _gate_result(root, rd, run, cur_rev, result, reasons, blocking, missing, inconclusive, waived, routes, na, applicable_rules, policy,
+                        extra={"required_roles": required_roles, "notes": notes, "open_findings": [{"id": f["id"], "severity": f["severity"], "task": f["task_id"]} for f in open_findings],
+                               "invalid_results": invalid, "effective_tasks": [t["task_id"] for t in eff]})
+
+
+def _gate_result(root, rd, run, cur_rev, result, reasons, blocking, missing, inconclusive, waived, routes, na, rules, policy, extra=None):
+    g = {
+        "gate_result": result,
+        "pass_mode": ("WITH_WAIVERS" if waived else "CLEAN") if result == "PASS" else None,
+        "run_id": run["run_id"], "risk_level": run["risk"].get("level"), "mode": run["request"].get("mode"),
+        "evaluated_revision": cur_rev, "evaluated_at": now_iso(),
+        "policy_id": policy.get("policy_id"), "policy_version": policy.get("version"),
+        "policy_digest": sha256_text(json.dumps(policy, sort_keys=True)),
+        "reason_codes": reasons, "blocking_requirements": blocking, "missing_requirements": missing,
+        "inconclusive_requirements": inconclusive, "waived_findings": waived, "remediation_routes": routes,
+        "not_applicable": na, "applicable_policy_rules": rules,
+    }
+    if extra:
+        g.update(extra)
+    g["evidence_bundle_digest"] = sha256_text(json.dumps({k: g[k] for k in ("effective_tasks", "evaluated_revision") if k in g}, sort_keys=True))
+    save_json(os.path.join(rd, "gate.json"), g)
+    hist = os.path.join(rd, "gate-history.jsonl")
+    with open(hist, "a", encoding="utf-8") as f:
+        f.write(json.dumps(g) + "\n")
+    audit(root, run["run_id"], "GATE_EVALUATED", {"result": result, "reasons": reasons, "revision": cur_rev}, actor="gate:harness")
+    run["status"]["state"] = {"PASS": "PASS", "FAIL": "FAIL", "NEEDS_HUMAN": "NEEDS_USER_DECISION", "NOT_APPLICABLE": "COMPLETE"}[result]
+    if result == "FAIL":
+        run["remediation_cycles"] = run.get("remediation_cycles", 0)
+    save_json(os.path.join(rd, "run.json"), run)
+    return g
+
+
+def cmd_gate(args):
+    root = project_root()
+    rid = resolve_run(root, args.run)
+    if os.environ.get("HARNESS_ROLE"):
+        die("worker sessions do not evaluate the gate; the orchestrator does")
+    g = evaluate_gate(root, rid)
+    if args.count_cycle and g["gate_result"] == "FAIL":
+        rd = run_dir(root, rid)
+        run = load_json(os.path.join(rd, "run.json"))
+        run["remediation_cycles"] = run.get("remediation_cycles", 0) + 1
+        save_json(os.path.join(rd, "run.json"), run)
+        g["remediation_cycles"] = run["remediation_cycles"]
+    print(json.dumps(g, indent=2))
+    sys.exit(GATE_EXIT[g["gate_result"]])
+
+
+def cmd_report(args):
+    root = project_root()
+    rid = resolve_run(root, args.run)
+    rd = run_dir(root, rid)
+    run = load_json(os.path.join(rd, "run.json"))
+    gp = os.path.join(rd, "gate.json")
+    g = load_json(gp) if os.path.exists(gp) else {"gate_result": "NOT_EVALUATED", "reason_codes": []}
+    eff, _ = effective_results(rd)
+    lines = []
+    status_map = {"PASS": "COMPLETE", "FAIL": "BLOCKED", "NEEDS_HUMAN": "NEEDS_USER_DECISION", "NOT_APPLICABLE": "COMPLETE", "NOT_EVALUATED": "IN_PROGRESS"}
+    lines.append(f"Status: {status_map[g['gate_result']]}  (gate {g['gate_result']}{' ' + g['pass_mode'] if g.get('pass_mode') else ''})")
+    lines.append(f"Risk: {run['risk'].get('level')}  triggers: {', '.join(run['risk'].get('triggers') or []) or '-'}")
+    lines.append(f"Workflow: {run['workflow'].get('model') or '-'}   Revision: {g.get('evaluated_revision') or revision_id(root)}")
+    lines.append("")
+    lines.append(f"Summary: {run['request'].get('summary','')}")
+    lines.append("")
+    files = sorted({f for t in eff for f in (t["result"].get("files_changed") or [])})
+    lines.append("Changed:")
+    lines += [f"- {f}" for f in files] or ["- (none recorded)"]
+    lines.append("")
+    lines.append("Tested / Verified:")
+    any_ev = False
+    for t in eff:
+        for e in t["result"].get("evidence", []) or []:
+            if e.get("type") in ("command", "test-run", "secrets-scan", "scan", "build"):
+                any_ev = True
+                lines.append(f"- [{t['task_id']}] {e.get('type')}: {e.get('command', e.get('summary'))[:90]} -> exit {e.get('exit_code', '-')}: {e.get('summary','')[:100]}")
+    if not any_ev:
+        lines.append("- (no command evidence recorded)")
+    lines.append("")
+    lines.append("Independent Review:")
+    for role in ("code-review", "security-review", "architecture-review", "test-verification", "security-testing", "ai-adversarial-testing", "dependency-review"):
+        for t in [x for x in eff if x["role"] == role]:
+            r = t["result"]
+            lines.append(f"- {role} by {r.get('principal_id')} on {r.get('revision')}: {r.get('status')}; findings={len(r.get('findings') or [])}")
+    lines.append("")
+    lines.append("Security / Policy:")
+    lines.append(f"- gate reasons: {', '.join(g.get('reason_codes') or [])}")
+    for na in g.get("not_applicable", []) or []:
+        lines.append(f"- not applicable: {na.get('role')} — {na.get('reason')}")
+    for w in g.get("waived_findings", []) or []:
+        lines.append(f"- WAIVED finding {w} (see waivers/)")
+    lines.append("")
+    lines.append("Evidence:")
+    lines.append(f"- run dir: {rd}")
+    lines.append(f"- audit trail: {os.path.join(rd, 'audit.jsonl')}")
+    lines.append(f"- gate record: {gp}")
+    lines.append("")
+    unres = [u for t in eff for u in (t["result"].get("unresolved") or [])]
+    res_risk = [u for t in eff for u in (t["result"].get("residual_risks") or [])]
+    lines.append("Uncertainties / Limitations:")
+    lines += [f"- {u}" for u in unres + res_risk] or ["- none recorded by workers"]
+    lines.append("")
+    lines.append("Follow-up Required:")
+    for r in g.get("remediation_routes", []) or []:
+        lines.append(f"- route to {r.get('route_to')}: {r.get('reason')}")
+    if g["gate_result"] == "NEEDS_HUMAN":
+        lines.append("- human decision needed; for R3 run:  harness approve --run %s --by human:<you>" % rid)
+    if not g.get("remediation_routes") and g["gate_result"] == "PASS":
+        lines.append("- none")
+    print("\n".join(lines))
+
+
+# ----------------------------------------------------------------------------
+# hooks (invoked by Claude Code via settings.json)
+# ----------------------------------------------------------------------------
+
+def cmd_hook(args):
+    try:
+        payload = json.load(sys.stdin) if not sys.stdin.isatty() else {}
+    except json.JSONDecodeError:
+        payload = {}
+    role = os.environ.get("HARNESS_ROLE")
+    if args.event == "session-start":
+        root = project_root()
+        if role:
+            print(f"[harness] worker session: role={role} agent={os.environ.get('HARNESS_AGENT')} task={os.environ.get('HARNESS_TASK')} "
+                  f"write={'yes' if os.environ.get('HARNESS_WRITE') == '1' else 'NO (read-only)'}. Run `harness envelope` for your run envelope.")
+            return
+        rid = latest_run_id(root)
+        if rid:
+            rd = os.path.join(runs_dir(root), rid)
+            run = load_json(os.path.join(rd, "run.json"), default={})
+            print(f"[harness] orchestrator session. Latest run {rid}: risk={run.get('risk',{}).get('level')} state={run.get('status',{}).get('state')}. "
+                  f"`harness status` for details. New work: `harness run new --request '...'`.")
+        else:
+            print("[harness] orchestrator session (Fable). No runs in this project yet. Change-producing requests go through `harness run new`.")
+        return
+    if args.event == "pre-tool-use":
+        if not role:
+            return
+        tool = payload.get("tool_name", "")
+        ti = payload.get("tool_input", {}) or {}
+        write_allowed = os.environ.get("HARNESS_WRITE") == "1"
+        task_dir_env = os.environ.get("HARNESS_TASK_DIR", "")
+        if tool in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
+            path = ti.get("file_path") or ti.get("notebook_path") or ""
+            in_task_dir = task_dir_env and os.path.abspath(path).startswith(os.path.abspath(task_dir_env))
+            if not write_allowed and not in_task_dir:
+                print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                  "permissionDecisionReason": f"harness: role '{role}' is read-only for product code. You may only write under your task dir {task_dir_env}. Record findings in result.json instead of fixing them."}}))
+                return
+            if path and os.path.abspath(path).startswith(os.path.abspath(os.path.join(project_root(), ".harness"))) and not in_task_dir:
+                print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                  "permissionDecisionReason": "harness: workers may not modify other tasks' evidence, policy, waivers, or approvals."}}))
+                return
+        if tool == "Bash":
+            cmd = ti.get("command", "")
+            if re.search(r"harness\s+(gate|waiver|approve|run\s+set)\b", cmd):
+                print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                  "permissionDecisionReason": "harness: workers may not evaluate the gate, issue waivers/approvals, or edit run classification."}}))
+                return
+            if not write_allowed and re.search(r"\bgit\s+(commit|push|checkout\s+--|reset|stash|rebase|merge|cherry-pick|clean|rm|mv|add)\b", cmd):
+                print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                  "permissionDecisionReason": f"harness: role '{role}' is read-only; git state-changing commands are blocked."}}))
+                return
+        return
+    if args.event == "stop":
+        if not role:
+            return
+        result_path = os.environ.get("HARNESS_RESULT")
+        if payload.get("stop_hook_active"):
+            return  # never loop forever; the gate will treat a missing/invalid result as MISSING
+        if not result_path or not os.path.exists(result_path):
+            print(json.dumps({"decision": "block", "reason": f"harness: you have not written your result contract yet. "
+                              f"Run `harness result template > {result_path}`, fill it with real evidence, then `harness result validate`."}))
+            return
+        try:
+            res = load_json(result_path)
+        except json.JSONDecodeError as e:
+            print(json.dumps({"decision": "block", "reason": f"harness: result.json is not valid JSON ({e}). Fix it and run `harness result validate`."}))
+            return
+        problems = validate_result(res)
+        root = project_root(os.path.dirname(result_path))
+        if res.get("revision") != revision_id(root):
+            problems.append("revision does not match the current working tree; run `harness rev` and update the result")
+        if problems:
+            print(json.dumps({"decision": "block", "reason": "harness: result contract invalid: " + "; ".join(problems[:6])}))
+            return
+        cmux_notify(f"harness: {os.environ.get('HARNESS_TASK')} {res.get('status')}",
+                    f"{os.environ.get('HARNESS_AGENT')} finished. {str(res.get('summary') or '')[:300]}")
+        try:
+            cmux_run(["set-status", "harness", f"{os.environ.get('HARNESS_TASK')} {res.get('status')}",
+                      "--icon", "checkmark" if res.get("status") == "PASS" else "xmark",
+                      "--color", "#2e9e5b" if res.get("status") == "PASS" else "#d0453b"], timeout=5)
+        except Exception:
+            pass
+        return
+    die(f"unknown hook event {args.event}")
+
+
+# ----------------------------------------------------------------------------
+# doctor
+# ----------------------------------------------------------------------------
+
+def cmd_doctor(args):
+    cfg = config()
+    checks = []
+    checks.append(("claude CLI", shutil.which("claude") or "MISSING"))
+    checks.append(("python3", sys.version.split()[0]))
+    checks.append(("osascript", shutil.which("osascript") or "MISSING (macOS only feature)"))
+    checks.append(("cmux CLI", shutil.which("cmux") or ("app bundle only" if os.path.isdir("/Applications/cmux.app") else "not installed  (brew install --cask cmux)")))
+    checks.append(("cmux socket", cmux_socket_path() or "not running (open cmux)"))
+    checks.append(("inside cmux workspace", os.environ.get("CMUX_WORKSPACE_ID", "(no; start claude inside a cmux tab)")))
+    checks.append(("Ghostty.app", "found" if os.path.isdir("/Applications/Ghostty.app") or os.path.isdir(os.path.expanduser("~/Applications/Ghostty.app")) else "not installed (optional fallback)"))
+    checks.append(("TERM_PROGRAM", os.environ.get("TERM_PROGRAM", "(unset)")))
+    checks.append(("terminal backend", detect_terminal(cfg)))
+    checks.append(("worker model/effort", f"{cfg.get('worker_model')} / {cfg.get('worker_effort')}"))
+    checks.append(("worker permission mode", cfg.get("worker_permission_mode")))
+    checks.append(("agents dir", str(len([f for f in os.listdir(os.path.expanduser('~/.claude/agents')) if f.endswith('.md')])) + " agent definitions"))
+    checks.append(("packs", str(len(all_packs())) + " practice packs"))
+    checks.append(("policy", POLICY_PATH if os.path.exists(POLICY_PATH) else "MISSING"))
+    settings = load_json(os.path.expanduser("~/.claude/settings.json"), default={})
+    hooks = settings.get("hooks", {})
+    checks.append(("hooks wired", ", ".join(k for k in ("SessionStart", "PreToolUse", "Stop") if k in hooks) or "NONE"))
+    for k, v in checks:
+        print(f"{k:<24} {v}")
+    if args.tab_test:
+        backend = detect_terminal(cfg)
+        print(f"\nOpening a throwaway '{backend}' tab that prints a message and exits...")
+        try:
+            r = open_tab(backend, "echo 'harness tab test OK — this tab can be closed'; sleep 20", "harness tab test", cfg, cwd=os.getcwd())
+            print("spawned:", r)
+        except Exception as e:
+            print("FAILED:", e)
+            if backend == "cmux":
+                print("cmux refuses connections from processes not started inside cmux. Run this from a tab inside cmux.")
+        return
+    if detect_terminal(cfg) == "cmux":
+        print("\nWorkers will open as new cmux workspaces (vertical tabs) named '<task> <agent>' without stealing focus;\n"
+              "completion shows up as a cmux notification + sidebar status pill.")
+    if detect_terminal(cfg) == "ghostty":
+        print("\nGhostty tabs are opened with System Events keystrokes. macOS must allow Ghostty under\n"
+              "System Settings > Privacy & Security > Accessibility (add Ghostty.app). Test with: harness spawn --dry-run ...")
+
+
+# ----------------------------------------------------------------------------
+# argument parsing
+# ----------------------------------------------------------------------------
+
+def main():
+    p = argparse.ArgumentParser(prog="harness", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sp = p.add_subparsers(dest="cmd", required=True)
+
+    s = sp.add_parser("doctor", help="check installation and terminal backend"); s.add_argument("--tab-test", action="store_true", help="open a throwaway tab to prove spawning works"); s.set_defaults(fn=cmd_doctor)
+    s = sp.add_parser("rev", help="print the revision id of the working tree"); s.set_defaults(fn=cmd_rev)
+    s = sp.add_parser("envelope", help="(worker) print this task's run envelope"); s.set_defaults(fn=cmd_envelope)
+    s = sp.add_parser("runs", help="list runs"); s.set_defaults(fn=cmd_runs)
+
+    r = sp.add_parser("run", help="manage orchestration runs").add_subparsers(dest="sub", required=True)
+    s = r.add_parser("new"); s.add_argument("--request", required=True); s.add_argument("--mode", choices=["READ_ONLY", "CHANGE", "VULNERABILITY_RESPONSE", "RELEASE"]); s.set_defaults(fn=cmd_run_new)
+    s = r.add_parser("set"); s.add_argument("--run"); s.add_argument("assignments", nargs="+"); s.add_argument("--justify"); s.set_defaults(fn=cmd_run_set)
+    s = r.add_parser("show"); s.add_argument("--run"); s.set_defaults(fn=cmd_run_show)
+
+    s = sp.add_parser("classify", help="risk hints from paths"); s.add_argument("paths", nargs="*"); s.add_argument("--git", action="store_true", help="include working-tree changed files"); s.set_defaults(fn=cmd_classify)
+
+    t = sp.add_parser("task", help="work packages").add_subparsers(dest="sub", required=True)
+    s = t.add_parser("new"); s.add_argument("--run"); s.add_argument("--id", required=True); s.add_argument("--agent", required=True); s.add_argument("--role", required=True)
+    s.add_argument("--write", action="store_true", default=None); s.add_argument("--depends"); s.add_argument("--retry-of"); s.add_argument("--title"); s.add_argument("--package-file"); s.add_argument("--revision"); s.set_defaults(fn=cmd_task_new)
+    s = t.add_parser("list"); s.add_argument("--run"); s.set_defaults(fn=cmd_task_list)
+
+    s = sp.add_parser("spawn", help="launch a worker session in a new terminal tab"); s.add_argument("--run"); s.add_argument("--task", required=True)
+    s.add_argument("--terminal", choices=["cmux", "ghostty", "iterm", "terminal", "tmux", "bg"]); s.add_argument("--model"); s.add_argument("--effort")
+    s.add_argument("--permission-mode"); s.add_argument("--dry-run", action="store_true"); s.add_argument("--force", action="store_true"); s.add_argument("--headless", action="store_true", help="run with -p in the background (no tab)")
+    s.set_defaults(fn=cmd_spawn)
+
+    s = sp.add_parser("wait", help="block until worker results exist (run in background)"); s.add_argument("--run"); s.add_argument("--task", nargs="*"); s.add_argument("--timeout", type=int, default=5400); s.add_argument("--interval", type=int, default=10); s.set_defaults(fn=cmd_wait)
+    s = sp.add_parser("status", help="run overview"); s.add_argument("--run"); s.set_defaults(fn=cmd_status)
+
+    rs = sp.add_parser("result", help="worker result contract").add_subparsers(dest="sub", required=True)
+    s = rs.add_parser("template"); s.add_argument("--run"); s.add_argument("--task"); s.set_defaults(fn=cmd_result_template)
+    s = rs.add_parser("validate"); s.add_argument("path", nargs="?"); s.set_defaults(fn=cmd_result_validate)
+
+    s = sp.add_parser("packs", help="applicable practice packs"); s.add_argument("--run"); s.add_argument("--agent"); s.add_argument("--list", action="store_true"); s.set_defaults(fn=cmd_packs)
+    s = sp.add_parser("scan", help="built-in deterministic scanners"); s.add_argument("kind", choices=["secrets", "deps"]); s.add_argument("paths", nargs="*"); s.add_argument("--all", action="store_true"); s.set_defaults(fn=cmd_scan)
+
+    s = sp.add_parser("waiver", help="(human) record an authorized exception"); s.add_argument("--run"); s.add_argument("--finding", nargs="+", required=True); s.add_argument("--rule", nargs="*"); s.add_argument("--reason", required=True)
+    s.add_argument("--control", nargs="*"); s.add_argument("--approved-by", required=True); s.add_argument("--role"); s.add_argument("--expires"); s.set_defaults(fn=cmd_waiver)
+    s = sp.add_parser("approve", help="(human) record release/R3 approval"); s.add_argument("--run"); s.add_argument("--by", required=True); s.add_argument("--role"); s.add_argument("--scope"); s.add_argument("--note"); s.set_defaults(fn=cmd_approve)
+
+    s = sp.add_parser("gate", help="evaluate the policy gate"); s.add_argument("--run"); s.add_argument("--count-cycle", action="store_true", help="count a FAIL as a remediation cycle"); s.set_defaults(fn=cmd_gate)
+    s = sp.add_parser("report", help="final user report from gate + evidence"); s.add_argument("--run"); s.set_defaults(fn=cmd_report)
+    s = sp.add_parser("hook", help="internal: Claude Code hook handler"); s.add_argument("event", choices=["session-start", "pre-tool-use", "stop"]); s.set_defaults(fn=cmd_hook)
+
+    args = p.parse_args()
+    args.fn(args)
+
+
+if __name__ == "__main__":
+    main()

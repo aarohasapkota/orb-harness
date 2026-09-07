@@ -1,0 +1,57 @@
+{
+  "policy_id": "harness-default-gate",
+  "version": "2026-09-05",
+  "$comment": "Deterministic reference policy evaluated by `harness gate`. A project may tighten it by adding .harness/policy/gate-policy.json (merged as overrides that can only add roles or lower thresholds; weakening is ignored). Roles here are the task roles in task.json, produced by the agents listed in the agent registry.",
+  "risk_profiles": {
+    "R0": {
+      "required_roles": ["implementer", "code-review"],
+      "conditional_roles": {}
+    },
+    "R1": {
+      "required_roles": ["requirements", "implementer", "test-verification", "code-review"],
+      "conditional_roles": {"dependency-review": "third_party_code_added", "domain-specialist": "persistent_data_affected"}
+    },
+    "R2": {
+      "required_roles": ["requirements", "threat-model", "implementer", "test-verification", "code-review", "security-review", "security-testing"],
+      "conditional_roles": {"dependency-review": "third_party_code_added", "domain-specialist": "persistent_data_affected",
+                            "build-security": "build_or_release_path_affected", "ai-adversarial-testing": "ai_scope"}
+    },
+    "R3": {
+      "required_roles": ["requirements", "threat-model", "architecture-review", "implementer", "test-verification", "code-review", "security-review", "security-testing", "secure-defaults"],
+      "conditional_roles": {"dependency-review": "third_party_code_added", "domain-specialist": "persistent_data_affected",
+                            "build-security": "build_or_release_path_affected", "release-integrity": "build_or_release_path_affected",
+                            "ai-adversarial-testing": "ai_scope"}
+    }
+  },
+  "vulnerability_response_roles": ["vulnerability-discovery", "triage", "remediation", "code-review", "security-testing"],
+  "never_not_applicable": ["implementer", "code-review", "remediation"],
+  "on_missing": {
+    "requirements": "FAIL", "threat-model": "FAIL", "architecture-review": "FAIL", "implementer": "FAIL", "test-verification": "FAIL",
+    "code-review": "FAIL", "security-review": "FAIL", "security-testing": "FAIL", "dependency-review": "FAIL", "domain-specialist": "NEEDS_HUMAN",
+    "build-security": "FAIL", "release-integrity": "NEEDS_HUMAN", "secure-defaults": "NEEDS_HUMAN", "ai-adversarial-testing": "FAIL",
+    "vulnerability-discovery": "FAIL", "triage": "FAIL", "remediation": "FAIL", "root-cause": "NEEDS_HUMAN", "regression-prevention": "NEEDS_HUMAN",
+    "secrets-scan": "FAIL"
+  },
+  "finding_thresholds": {
+    "R0": {"blocking": ["critical", "high"], "waivable": ["high"]},
+    "R1": {"blocking": ["critical", "high"], "waivable": ["high"]},
+    "R2": {"blocking": ["critical", "high"], "waivable": ["high"]},
+    "R3": {"blocking": ["critical", "high", "medium"], "waivable": ["high", "medium"]}
+  },
+  "non_waivable": ["critical findings", "author-as-reviewer", "reviewer modified files", "stale review evidence", "failed required tests", "invalid result records"],
+  "remediation_routes": {
+    "finding": "implementer", "code-review": "implementer", "security-review": "implementer", "security-testing": "implementer",
+    "test-verification": "implementer", "dependency-review": "dependency-review", "threat-model": "threat-model",
+    "architecture-review": "architecture-review", "build-security": "domain-specialist", "release-integrity": "release-integrity",
+    "ai-adversarial-testing": "implementer", "requirements": "requirements", "secure-defaults": "implementer",
+    "vulnerability-discovery": "vulnerability-discovery", "triage": "triage", "remediation": "remediation",
+    "root-cause": "root-cause", "regression-prevention": "regression-prevention"
+  },
+  "separation_of_duties": {
+    "implementer_not_reviewer": true,
+    "code_review_not_security_testing": true,
+    "r3_security_review_distinct_from_code_review": true,
+    "reviewers_read_only": true,
+    "review_bound_to_final_revision": true
+  }
+}

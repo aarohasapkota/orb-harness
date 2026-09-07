@@ -1,0 +1,8 @@
+# harness runtime state (per project evidence, spawn scripts)
+.harness/
+harness/launch/
+harness/.orb-harness-manifest
+harness/config.json.dist
+__pycache__/
+*.pyc
+.DS_Store
