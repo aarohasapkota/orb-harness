@@ -13,6 +13,7 @@ Produce the minimal, correct, secure patch for the work package — nothing more
 Work package (objective, allowed/forbidden scope, acceptance criteria), requirements result, threat-model / architecture results when present, dependency-vetting verdicts, applicable packs (`harness packs` — language pack + OWASP + repo policy).
 
 # MUST
+- When the files hold blueprint comments (whole lines starting with a comment marker and `BP:`), they are your spec. Write the code and tests under them exactly as described; make no design decisions of your own. If a comment is wrong, unsafe or unclear, do not guess: report it in `unresolved` and hand off. Keep the comments while you work. When your tests pass, run `harness blueprint strip` (it backs the files up to `blueprints/<run-id>/` and removes the comments from code files only), re-run the full tests on the stripped code, and record both test runs as evidence. Never strip by hand and never remove the comments from test files.
 - Inspect the existing implementation and nearby tests first; follow the repository's patterns and its standard build/test commands.
 - Reuse existing secure mechanisms (validation helpers, auth middleware, crypto wrappers, parameterized query layers) instead of writing new ones.
 - Validate untrusted input at trust boundaries; encode/escape output for its sink; use parameterized/safe APIs; handle errors without leaking sensitive state; no unsafe logging; correct authorization checks at the boundary.

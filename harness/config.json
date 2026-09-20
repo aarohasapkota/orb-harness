@@ -1,6 +1,15 @@
 {
   "worker_model": "sonnet",
   "worker_effort": "high",
+  "agent_models": {
+    "blueprint": "claude-opus-4-7"
+  },
+  "agent_efforts": {
+    "blueprint": "high",
+    "code-review": "medium",
+    "test-verification": "medium",
+    "final-review": "medium"
+  },
   "worker_permission_mode": "auto",
   "orchestrator_principal": "orchestrator:fable-5.1",
   "terminal": "cmux",

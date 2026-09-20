@@ -13,6 +13,7 @@ structured evidence files under <project>/.harness/runs/<run-id>/.
 """
 import argparse
 import datetime as _dt
+import fnmatch
 import hashlib
 import json
 import os
@@ -64,6 +65,17 @@ def save_json(path, data):
 
 def sha256_text(text):
     return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+# built-in defaults so an older config.json without these keys still works
+AGENT_DEFAULTS = {
+    "agent_models": {"blueprint": "claude-opus-4-7"},
+    "agent_efforts": {"code-review": "medium", "test-verification": "medium", "final-review": "medium"},
+}
+
+
+def agent_setting(cfg, key, agent):
+    return (cfg.get(key) or {}).get(agent) or AGENT_DEFAULTS.get(key, {}).get(agent)
 
 
 def config():
@@ -404,11 +416,16 @@ def cmd_classify(args):
 # ----------------------------------------------------------------------------
 
 ROLES = ["context", "requirements", "governance", "threat-model", "architecture-review", "dependency-review",
-         "domain-specialist", "implementer", "test-verification", "code-review", "security-review",
+         "domain-specialist", "blueprint", "implementer", "final-review", "test-verification", "code-review", "security-review",
          "security-testing", "ai-adversarial-testing", "build-security", "secure-defaults", "release-integrity",
          "vulnerability-discovery", "triage", "remediation", "root-cause", "regression-prevention", "other"]
 
-WRITE_ROLES = {"implementer", "remediation", "regression-prevention", "domain-specialist"}
+WRITE_ROLES = {"blueprint", "implementer", "remediation", "regression-prevention", "domain-specialist"}
+
+# files inside a task dir that define the task; workers may not edit their own
+CONTROL_FILES = {"task.json", "envelope.json", "launch.sh", "package.md", "system-append.md"}
+
+AGENTS_DIR = os.path.expanduser(os.environ.get("HARNESS_AGENTS_DIR", "~/.claude/agents"))
 
 
 def task_dir(rd, task_id):
@@ -422,7 +439,7 @@ def cmd_task_new(args):
     run = load_json(os.path.join(rd, "run.json"))
     if args.role not in ROLES:
         die(f"role must be one of: {', '.join(ROLES)}")
-    agent_path = os.path.expanduser(f"~/.claude/agents/{args.agent}.md")
+    agent_path = os.path.join(AGENTS_DIR, f"{args.agent}.md")
     if not os.path.exists(agent_path):
         die(f"agent definition not found: {agent_path}")
     td = task_dir(rd, args.id)
@@ -438,11 +455,14 @@ def cmd_task_new(args):
     write = bool(args.write) or (args.role in WRITE_ROLES and args.write is None)
     if args.role in ("code-review", "security-review", "security-testing", "ai-adversarial-testing", "test-verification",
                      "threat-model", "architecture-review", "requirements", "context", "dependency-review", "release-integrity",
-                     "triage", "root-cause", "vulnerability-discovery", "governance", "secure-defaults", "build-security") and write:
+                     "triage", "root-cause", "vulnerability-discovery", "governance", "secure-defaults", "build-security", "final-review") and write:
         die(f"role '{args.role}' is read-only with respect to product code; drop --write")
+    owned = [x.strip() for x in (args.owned or "").split(",") if x.strip()]
+    if args.role == "blueprint" and not owned:
+        die("a blueprint task needs --owned <paths>: the files or folders it may write its comments into")
     task = {
         "task_id": args.id, "run_id": rid, "agent": args.agent, "role": args.role,
-        "principal_id": f"agent:{args.agent}", "write": write,
+        "principal_id": f"agent:{args.agent}", "write": write, "owned_paths": owned,
         "depends_on": [x for x in (args.depends or "").split(",") if x],
         "retry_of": args.retry_of, "title": args.title or f"{args.role} ({args.agent})",
         "created_at": now_iso(), "spawned_at": None, "spawn_backend": None, "revision_at_spawn": None,
@@ -637,8 +657,8 @@ def cmd_spawn(args):
     if not task.get("write"):
         task["expected_revision"] = task.get("expected_revision") or rev
 
-    model = args.model or cfg.get("worker_model", "sonnet")
-    effort = args.effort or cfg.get("worker_effort", "high")
+    model = args.model or agent_setting(cfg, "agent_models", task["agent"]) or cfg.get("worker_model", "sonnet")
+    effort = args.effort or agent_setting(cfg, "agent_efforts", task["agent"]) or cfg.get("worker_effort", "high")
     perm = args.permission_mode or cfg.get("worker_permission_mode", "acceptEdits")
     name = f"{task['task_id']} {task['agent']}"
     result_path = os.path.join(td, "result.json")
@@ -655,6 +675,8 @@ def cmd_spawn(args):
         "HARNESS_PROJECT": root,
         "HARNESS_RISK": run["risk"].get("level") or "unclassified",
         "HARNESS_REVISION_AT_SPAWN": rev,
+        "HARNESS_OWNED_PATHS": json.dumps(task.get("owned_paths") or []),
+        "HARNESS_MODEL": model,
     }
     preamble = open(PREAMBLE_PATH, encoding="utf-8").read() if os.path.exists(PREAMBLE_PATH) else ""
     envelope = {
@@ -665,6 +687,7 @@ def cmd_spawn(args):
         "classification": run.get("classification"), "scope": run.get("scope"), "languages": run.get("languages"),
         "revision_at_spawn": rev, "result_path": result_path, "task_dir": td, "project_root": root,
         "upstream_results": [os.path.join(rd, "tasks", d, "result.json") for d in task.get("depends_on", [])],
+        "owned_paths": task.get("owned_paths") or [], "model": model,
     }
     save_json(os.path.join(td, "envelope.json"), envelope)
     system_append = preamble.replace("{{ENVELOPE}}", json.dumps(envelope, indent=2))
@@ -1160,6 +1183,162 @@ def cmd_approve(args):
 # the policy gate
 # ----------------------------------------------------------------------------
 
+# ----------------------------------------------------------------------------
+# blueprint comments: tag format, strip + backup, backup commit
+# ----------------------------------------------------------------------------
+# A blueprint comment is a WHOLE line that holds nothing but a comment starting with the marker `BP:`,
+# e.g.   # BP: reject the request when the token is expired      (python, shell, yaml, ...)
+#        // BP: return 404 when the row is missing               (js, ts, go, java, c, rust, ...)
+#        -- BP: ...   /* BP: ... */   <!-- BP: ... -->
+# Code never shares a line with the marker, so removing the line can never remove code.
+
+BP_LINE = re.compile(r"^[ \t]*(?:(?:#|//|--|;)[ \t]?BP:.*|/\*[ \t]?BP:.*\*/[ \t]*|<!--[ \t]?BP:.*-->[ \t]*)$")
+TEST_PATH = re.compile(r"(^|/)(tests?|__tests__|spec|specs)/|[._-](test|spec)\.[A-Za-z0-9]+$|(^|/)test_[^/]*$|(^|/)conftest\.py$")
+BACKUP_DIR = "blueprints"
+
+
+def is_test_path(rel):
+    return bool(TEST_PATH.search(rel.replace(os.sep, "/")))
+
+
+def working_tree_files(root):
+    """Every changed or new file, one path per file (git only)."""
+    out = git(root, "status", "--porcelain", "--untracked-files=all", "--", ".", ":(exclude).harness").stdout
+    files = []
+    for line in out.splitlines():
+        if len(line) > 3 and line[:2].strip() != "D":
+            path = line[3:].strip().strip('"')
+            files.append(path.split(" -> ", 1)[1] if " -> " in path else path)
+    return files
+
+
+def blueprint_lines(path):
+    try:
+        text = open(path, encoding="utf-8").read()
+    except (OSError, UnicodeDecodeError):
+        return None, []
+    lines = text.splitlines(keepends=True)
+    return lines, [i for i, l in enumerate(lines) if BP_LINE.match(l.rstrip("\r\n"))]
+
+
+def unstripped_code_files(root):
+    """Changed non-test files that still hold blueprint comments."""
+    found = []
+    for rel in working_tree_files(root):
+        p = os.path.join(root, rel)
+        if rel.startswith(BACKUP_DIR + "/") or os.path.islink(p) or not os.path.isfile(p) or is_test_path(rel):
+            continue
+        if blueprint_lines(p)[1]:
+            found.append(rel)
+    return found
+
+
+def cmd_blueprint_strip(args):
+    """Back up every blueprinted file, then remove the blueprint comments from non-test code."""
+    root = project_root()
+    rid = resolve_run(root, args.run)
+    if not is_git(root):
+        die("blueprint strip needs a git repository (the backup is kept in git)")
+    dest_root = os.path.join(root, BACKUP_DIR, rid)
+    plan = []
+    for rel in working_tree_files(root):
+        p = os.path.join(root, rel)
+        if rel.startswith(BACKUP_DIR + "/") or os.path.islink(p) or not os.path.isfile(p):
+            continue
+        if not os.path.realpath(p).startswith(os.path.realpath(root) + os.sep):
+            continue
+        lines, hits = blueprint_lines(p)
+        if hits:
+            plan.append({"path": rel, "kind": "test" if is_test_path(rel) else "code", "comments": len(hits)})
+    if args.dry_run:
+        print(json.dumps({"dry_run": True, "backup_dir": dest_root, "files": plan}, indent=2))
+        return
+    # 1. back up everything first; stop before touching code if any copy fails
+    for item in plan:
+        dest = os.path.join(dest_root, item["path"])
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        if not os.path.exists(dest):  # never overwrite an earlier backup with an already-stripped file
+            shutil.copy2(os.path.join(root, item["path"]), dest)
+        if not os.path.isfile(dest):
+            die(f"backup of {item['path']} failed; nothing was stripped")
+    # 2. strip code files only; tests keep their comments
+    for item in plan:
+        if item["kind"] != "code":
+            continue
+        p = os.path.join(root, item["path"])
+        lines, hits = blueprint_lines(p)
+        drop = set(hits)
+        with open(p, "w", encoding="utf-8") as f:
+            f.writelines(l for i, l in enumerate(lines) if i not in drop)
+    rd = run_dir(root, rid)
+    record = {"run_id": rid, "stripped_at": now_iso(), "backup_dir": os.path.relpath(dest_root, root), "files": plan,
+              "revision_after": revision_id(root)}
+    save_json(os.path.join(rd, "blueprint-strip.json"), record)
+    audit(root, rid, "BLUEPRINT_STRIPPED", {"files": plan})
+    print(json.dumps(dict(record, next="re-run the tests: the stripped code must still pass"), indent=2))
+
+
+def cmd_blueprint_check(args):
+    root = project_root()
+    left = unstripped_code_files(root)
+    print(json.dumps({"unstripped_code_files": left, "status": "fail" if left else "pass"}, indent=2))
+    sys.exit(1 if left else 0)
+
+
+def cmd_blueprint_commit_backup(args):
+    """The one commit the orchestrator may make: the blueprint backup folder of a run that passed. Never pushes."""
+    root = project_root()
+    rid = resolve_run(root, args.run)
+    if os.environ.get("HARNESS_ROLE"):
+        die("worker sessions do not commit; the orchestrator does, after the gate passes")
+    rd = run_dir(root, rid)
+    g = load_json(os.path.join(rd, "gate.json"), default={})
+    if g.get("gate_result") != "PASS":
+        die(f"run {rid} has not passed the gate (result: {g.get('gate_result') or 'not evaluated'}); nothing committed")
+    rel_dir = f"{BACKUP_DIR}/{rid}"
+    if not os.path.isdir(os.path.join(root, rel_dir)):
+        die(f"no blueprint backup at {rel_dir}; nothing to commit")
+    staged = [l for l in git(root, "diff", "--cached", "--name-only").stdout.splitlines() if l.strip()]
+    if staged:
+        die("other files are already staged; commit or unstage them first so the backup commit holds only the backup: " + ", ".join(staged[:5]))
+    files = [os.path.relpath(os.path.join(dp, f), root) for dp, _, fs in os.walk(os.path.join(root, rel_dir)) for f in fs]
+    scan = scan_secrets(root, files)
+    if scan["findings"]:
+        die("secret-like content found in the blueprint backup; nothing committed: " + json.dumps(scan["findings"][:3]))
+    run = load_json(os.path.join(rd, "run.json"))
+    git(root, "add", "--", rel_dir)
+    msg = f"blueprint: {rid} {run['request'].get('summary', '')[:60]}"
+    r = git(root, "commit", "-m", msg, "--", rel_dir)
+    if r.returncode != 0:
+        die("git commit failed: " + (r.stderr or r.stdout).strip()[:300])
+    audit(root, rid, "BLUEPRINT_BACKUP_COMMITTED", {"dir": rel_dir, "files": len(files)})
+    print(json.dumps({"committed": rel_dir, "files": len(files), "message": msg, "pushed": False}, indent=2))
+
+
+def cmd_followup(args):
+    """Orchestrator's tech-lead call: a non-critical finding becomes recorded follow-up work instead of blocking."""
+    root = project_root()
+    rid = resolve_run(root, args.run)
+    if os.environ.get("HARNESS_ROLE"):
+        die("worker sessions cannot defer findings; the orchestrator decides")
+    rd = run_dir(root, rid)
+    eff, _ = effective_results(rd)
+    known = {f["id"]: f for t in eff for f in (t["result"].get("findings") or [])}
+    known.update({f"{t['task_id']}:{f['id']}": f for t in eff for f in (t["result"].get("findings") or [])})
+    for fid in args.finding:
+        if fid not in known:
+            die(f"unknown finding '{fid}'")
+        if known[fid].get("severity") == "critical":
+            die(f"finding '{fid}' is critical; critical findings must be fixed and can never be deferred")
+    d = os.path.join(rd, "followups")
+    os.makedirs(d, exist_ok=True)
+    rec = {"followup_id": uuid.uuid4().hex[:8], "finding_ids": args.finding, "reason": args.reason,
+           "decided_by": config().get("orchestrator_principal", "orchestrator"), "decided_at": now_iso()}
+    save_json(os.path.join(d, rec["followup_id"] + ".json"), rec)
+    audit(root, rid, "FINDING_DEFERRED", rec)
+    print(json.dumps(rec, indent=2))
+
+
 def effective_results(rd):
     """Latest valid result per task; later retries supersede the task they retry."""
     tasks = _tasks(rd)
@@ -1233,6 +1412,12 @@ def evaluate_gate(root, rid, policy=None):
         if RISK_ORDER[risk] >= 2:
             required_roles += ["root-cause", "regression-prevention"]
         required_roles = [r for r in required_roles if r != "implementer"] if "remediation" in required_roles else required_roles
+        required_roles = [r for r in required_roles if r != "blueprint"]  # a vulnerability fix follows the triage criteria, not a blueprint
+    # One final review is owed once the reviewers' findings led to a fix pass (an implementer retry).
+    impl_role_name = "remediation" if "remediation" in required_roles else "implementer"
+    fix_pass = any(t.get("retry_of") and t["role"] == impl_role_name for t in all_tasks)
+    if fix_pass and risk in policy.get("review_shape", {}).get("final_review_after_fix", ["R1", "R2", "R3"]):
+        required_roles.append("final-review")
     required_roles = list(dict.fromkeys(required_roles))
     applicable_rules = [{"rule_id": f"role.{r}", "required": True} for r in required_roles]
 
@@ -1242,6 +1427,13 @@ def evaluate_gate(root, rid, policy=None):
     if impl is None and risk == "R0" and run.get("orchestrator_implemented"):
         impl_principal = cfg.get("orchestrator_principal", "orchestrator")
         notes.append("R0: orchestrator implemented directly (permitted by policy for non-executable changes)")
+
+    LENS_ROLES = ("code-review", "security-review", "test-verification")
+    fr = latest("final-review")
+    covered_by_final = bool(fr and fr["result"]["status"] == "PASS" and fr["result"].get("revision") == cur_rev)
+    closed_by_final = set(fr["result"].get("closed_findings") or []) if covered_by_final else set()
+    if covered_by_final:
+        notes.append("final review passed on this revision: it confirms the reviewers' findings are closed and the fix broke nothing")
 
     for role in required_roles:
         if role == impl_role and impl is None and impl_principal:
@@ -1270,6 +1462,8 @@ def evaluate_gate(root, rid, policy=None):
                 reasons.append("NOT_APPLICABLE_MISUSED")
                 blocking.append(f"role.{role}")
             continue
+        if covered_by_final and role in LENS_ROLES and st in ("FAIL", "NEEDS_REVIEW"):
+            continue  # its findings are judged one by one below (closed, deferred, or still blocking)
         if st in ("FAIL", "BLOCKED"):
             blocking.append(f"role.{role}")
             reasons.append(f"{role.upper().replace('-', '_')}_{st}")
@@ -1284,9 +1478,9 @@ def evaluate_gate(root, rid, policy=None):
     # final implementation. Design-time roles (architecture-review) bind to the design, dependency-review
     # binds to the manifest/lock digest (checked below), not to the final tree.
     sod_roles = [r for r in ("code-review", "security-review", "test-verification", "security-testing", "ai-adversarial-testing",
-                             "architecture-review", "dependency-review", "release-integrity", "build-security", "secure-defaults") if r in required_roles]
+                             "architecture-review", "dependency-review", "release-integrity", "build-security", "secure-defaults", "final-review") if r in required_roles]
     fresh_roles = {"code-review", "security-review", "test-verification", "security-testing", "ai-adversarial-testing",
-                   "release-integrity", "build-security", "secure-defaults"}
+                   "release-integrity", "build-security", "secure-defaults", "final-review"}
     for role in sod_roles:
         lt = latest(role)
         if not lt:
@@ -1300,7 +1494,9 @@ def evaluate_gate(root, rid, policy=None):
             blocking.append(f"readonly.{role}")
             reasons.append("REVIEWER_MODIFIED_FILES")
             routes.append({"route_to": "orchestrator", "reason": f"{role} task {lt['task_id']} reports files_changed; reviewers must be read-only"})
-        if role in fresh_roles and lt["result"].get("revision") != cur_rev:
+        if covered_by_final and role in LENS_ROLES:
+            pass  # reviewed the pre-fix revision by design; the final review covers the fix
+        elif role in fresh_roles and lt["result"].get("revision") != cur_rev:
             blocking.append(f"stale.{role}")
             reasons.append("STALE_REVIEW_EVIDENCE")
             routes.append({"route_to": role, "reason": f"{role} evidence bound to {lt['result'].get('revision')} but working tree is {cur_rev}; re-run against final revision"})
@@ -1311,6 +1507,21 @@ def evaluate_gate(root, rid, policy=None):
     if cr and stt and cr["result"].get("principal_id") == stt["result"].get("principal_id"):
         blocking.append("sod.review-vs-testing")
         reasons.append("CODE_REVIEW_AND_SECURITY_TESTING_SAME_PRINCIPAL")
+    # the final reviewer and the blueprint author must be different principals from every reviewer
+    lens_principals = {latest(r)["result"].get("principal_id") for r in LENS_ROLES if latest(r)}
+    if fr and (fr["result"].get("principal_id") in lens_principals or fr["result"].get("principal_id") == impl_principal):
+        blocking.append("sod.final-review")
+        reasons.append("FINAL_REVIEW_NOT_INDEPENDENT")
+    bp = latest("blueprint")
+    if bp:
+        if bp["result"].get("principal_id") in lens_principals | ({fr["result"].get("principal_id")} if fr else set()):
+            blocking.append("sod.blueprint")
+            reasons.append("BLUEPRINT_AUTHOR_IS_REVIEWER")
+        left = unstripped_code_files(root) if is_git(root) else []
+        if left:
+            blocking.append("blueprint.not_stripped")
+            reasons.append("BLUEPRINT_NOT_STRIPPED")
+            routes.append({"route_to": "implementer", "reason": f"blueprint comments remain in code files {left[:8]}; run `harness blueprint strip` and re-run the tests"})
     if impl and impl["result"].get("revision") != cur_rev:
         blocking.append("revision.implementer")
         reasons.append("UNEXPLAINED_CHANGES_AFTER_IMPLEMENTATION")
@@ -1344,13 +1555,23 @@ def evaluate_gate(root, rid, policy=None):
         if ok:
             for fid in w.get("finding_ids", []):
                 valid_waivers[fid] = w["waiver_id"]
-    open_findings = []
+    fdir = os.path.join(rd, "followups")
+    deferred_ids = {fid for w in (sorted(os.listdir(fdir)) if os.path.isdir(fdir) else []) for fid in load_json(os.path.join(fdir, w)).get("finding_ids", [])}
+    open_findings, deferred = [], []
     for t in eff:
         for f in t["result"].get("findings", []) or []:
             if f.get("status") == "open":
                 ff = dict(f)
                 ff["task_id"] = t["task_id"]
+                keys = {f["id"], f"{t['task_id']}:{f['id']}"}
+                if keys & closed_by_final:
+                    continue
+                if keys & deferred_ids and f.get("severity") != "critical":
+                    deferred.append(ff)
+                    continue
                 open_findings.append(ff)
+    if deferred:
+        reasons.append("FOLLOW_UP_RECORDED_BY_ORCHESTRATOR")
     thresholds = policy["finding_thresholds"][risk]
     for f in open_findings:
         sev = f["severity"]
@@ -1431,7 +1652,8 @@ def evaluate_gate(root, rid, policy=None):
             reasons.append("AUTHORIZED_WAIVER_APPLIED")
     return _gate_result(root, rd, run, cur_rev, result, reasons, blocking, missing, inconclusive, waived, routes, na, applicable_rules, policy,
                         extra={"required_roles": required_roles, "notes": notes, "open_findings": [{"id": f["id"], "severity": f["severity"], "task": f["task_id"]} for f in open_findings],
-                               "invalid_results": invalid, "effective_tasks": [t["task_id"] for t in eff]})
+                               "invalid_results": invalid, "effective_tasks": [t["task_id"] for t in eff],
+                               "deferred_findings": [{"id": f["id"], "severity": f["severity"], "task": f["task_id"], "description": f.get("description", "")[:200]} for f in deferred]})
 
 
 def _gate_result(root, rd, run, cur_rev, result, reasons, blocking, missing, inconclusive, waived, routes, na, rules, policy, extra=None):
@@ -1487,8 +1709,15 @@ def cmd_report(args):
     eff, _ = effective_results(rd)
     lines = []
     status_map = {"PASS": "COMPLETE", "FAIL": "BLOCKED", "NEEDS_HUMAN": "NEEDS_USER_DECISION", "NOT_APPLICABLE": "COMPLETE", "NOT_EVALUATED": "IN_PROGRESS"}
+    plain_status = {"PASS": "Done. Every required check passed for this exact version of the code.",
+                    "FAIL": "Not done. At least one required check failed or is missing; see Follow-up Required.",
+                    "NEEDS_HUMAN": "Waiting on you. The checks are finished and a decision only you can make is open.",
+                    "NOT_APPLICABLE": "Nothing to check for this request.", "NOT_EVALUATED": "Still in progress; the final check has not run yet."}
+    plain_risk = {"R0": "docs only", "R1": "small, local code change", "R2": "medium: touches outside input, data, dependencies or a public interface",
+                  "R3": "high: touches login, permissions, secrets, releases, infrastructure or AI tool use; needs your approval"}
     lines.append(f"Status: {status_map[g['gate_result']]}  (gate {g['gate_result']}{' ' + g['pass_mode'] if g.get('pass_mode') else ''})")
-    lines.append(f"Risk: {run['risk'].get('level')}  triggers: {', '.join(run['risk'].get('triggers') or []) or '-'}")
+    lines.append(f"In plain words: {plain_status[g['gate_result']]}")
+    lines.append(f"Risk: {run['risk'].get('level')} ({plain_risk.get(run['risk'].get('level'), 'not classified yet')})  triggers: {', '.join(run['risk'].get('triggers') or []) or '-'}")
     lines.append(f"Workflow: {run['workflow'].get('model') or '-'}   Revision: {g.get('evaluated_revision') or revision_id(root)}")
     lines.append("")
     lines.append(f"Summary: {run['request'].get('summary','')}")
@@ -1508,7 +1737,7 @@ def cmd_report(args):
         lines.append("- (no command evidence recorded)")
     lines.append("")
     lines.append("Independent Review:")
-    for role in ("code-review", "security-review", "architecture-review", "test-verification", "security-testing", "ai-adversarial-testing", "dependency-review"):
+    for role in ("blueprint", "code-review", "security-review", "test-verification", "final-review", "architecture-review", "security-testing", "ai-adversarial-testing", "dependency-review"):
         for t in [x for x in eff if x["role"] == role]:
             r = t["result"]
             lines.append(f"- {role} by {r.get('principal_id')} on {r.get('revision')}: {r.get('status')}; findings={len(r.get('findings') or [])}")
@@ -1531,11 +1760,13 @@ def cmd_report(args):
     lines += [f"- {u}" for u in unres + res_risk] or ["- none recorded by workers"]
     lines.append("")
     lines.append("Follow-up Required:")
+    for d in g.get("deferred_findings", []) or []:
+        lines.append(f"- later, not blocking ({d['severity']}, {d['task']}:{d['id']}): {d['description']}")
     for r in g.get("remediation_routes", []) or []:
         lines.append(f"- route to {r.get('route_to')}: {r.get('reason')}")
     if g["gate_result"] == "NEEDS_HUMAN":
         lines.append("- human decision needed; for R3 run:  harness approve --run %s --by human:<you>" % rid)
-    if not g.get("remediation_routes") and g["gate_result"] == "PASS":
+    if not g.get("remediation_routes") and not g.get("deferred_findings") and g["gate_result"] == "PASS":
         lines.append("- none")
     print("\n".join(lines))
 
@@ -1543,6 +1774,107 @@ def cmd_report(args):
 # ----------------------------------------------------------------------------
 # hooks (invoked by Claude Code via settings.json)
 # ----------------------------------------------------------------------------
+
+def executed_commands(cmd):
+    """Split a shell command line into the argv lists that would actually run.
+
+    Heredoc bodies and quoted text are data, not commands, so a worker writing a document that mentions
+    `git commit` is not mistaken for a worker running it. Returns None when the line cannot be parsed;
+    callers then fall back to the old text search (fail closed)."""
+    lines, out, delim = cmd.replace("\\\n", " ").split("\n"), [], None
+    for line in lines:
+        if delim is not None:
+            if line.strip() == delim:
+                delim = None
+            continue
+        m = re.search(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1", line)
+        if m:
+            delim = m.group(2)
+            line = line[:m.start()]
+        out.append(line)
+    try:
+        lex = shlex.shlex(" ; ".join(out), posix=True, punctuation_chars=";&|()")
+        lex.whitespace_split = True
+        tokens = list(lex)
+    except ValueError:
+        return None
+    cmds, cur = [], []
+    for tok in tokens:
+        if tok and set(tok) <= set(";&|()"):
+            if cur:
+                cmds.append(cur)
+            cur = []
+        else:
+            cur.append(tok)
+    if cur:
+        cmds.append(cur)
+    flat = []
+    for argv in cmds:
+        while argv and (re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", argv[0]) or argv[0] in ("env", "command", "sudo", "exec", "time", "nohup", "then", "do", "else", "{", "!")):
+            argv = argv[1:]
+        if not argv:
+            continue
+        flat.append(argv)
+        if os.path.basename(argv[0]) in ("bash", "sh", "zsh") and "-c" in argv and argv.index("-c") + 1 < len(argv):
+            inner = executed_commands(argv[argv.index("-c") + 1])
+            if inner is None:
+                return None
+            flat += inner
+    return flat
+
+
+GIT_STATE_CHANGING = {"commit", "push", "reset", "stash", "rebase", "merge", "cherry-pick", "clean", "rm", "mv", "add"}
+
+
+def git_subcommand(argv):
+    """('commit', rest) for `git -C x commit ...`; (None, []) when argv is not git."""
+    if os.path.basename(argv[0]) != "git":
+        return None, []
+    i = 1
+    while i < len(argv) and argv[i].startswith("-"):
+        i += 2 if argv[i] in ("-C", "-c", "--git-dir", "--work-tree") else 1
+    return (argv[i], argv[i + 1:]) if i < len(argv) else (None, [])
+
+
+def bash_denial(cmd, role, write_allowed):
+    """Reason string when a worker's shell command must be blocked, else None."""
+    cmds = executed_commands(cmd)
+    if cmds is None:  # unparseable: keep the strict text search
+        if re.search(r"harness\s+(gate|waiver|approve|followup|run\s+set|blueprint\s+commit-backup)\b", cmd):
+            return "harness: workers may not evaluate the gate, issue waivers/approvals/follow-ups, or edit run classification."
+        if re.search(r"\bgit\s+(commit|push)\b", cmd) or (not write_allowed and re.search(r"\bgit\s+(checkout\s+--|reset|stash|rebase|merge|cherry-pick|clean|rm|mv|add)\b", cmd)):
+            return f"harness: role '{role}' may not run git state-changing commands."
+        return None
+    task_dir_env = os.path.abspath(os.environ.get("HARNESS_TASK_DIR", "") or "/nonexistent")
+    for argv in cmds:
+        if os.path.basename(argv[0]) == "harness" and len(argv) > 1:
+            sub = argv[1:3]
+            if sub[0] in ("gate", "waiver", "approve", "followup") or sub == ["run", "set"] or sub == ["blueprint", "commit-backup"]:
+                return "harness: workers may not evaluate the gate, issue waivers/approvals/follow-ups, or edit run classification."
+        gsub, rest = git_subcommand(argv)
+        if gsub in ("commit", "push"):
+            return f"harness: workers never commit or push; the human (and `harness blueprint commit-backup` for blueprints) does."
+        if gsub and (not write_allowed or role == "blueprint"):
+            if gsub in GIT_STATE_CHANGING or (gsub == "checkout" and "--" in rest):
+                return f"harness: role '{role}' may not run git state-changing commands."
+        # a worker may not rewrite the files that define its own task
+        for a in argv[1:]:
+            ap = os.path.abspath(a)
+            if os.path.basename(ap) in CONTROL_FILES and os.path.dirname(ap) == task_dir_env and os.path.basename(argv[0]) not in ("cat", "less", "head", "tail", "wc", "grep", "rg", "jq", "ls", "stat", "diff"):
+                return "harness: workers may not change the files that define their own task (task.json, package.md, ...)."
+    return None
+
+
+def path_owned(path, owned, root):
+    rel = os.path.relpath(os.path.realpath(path), os.path.realpath(root))
+    if rel.startswith(".."):
+        return False
+    for o in owned:
+        o = o.rstrip("/").lstrip("./") if o not in (".",) else o
+        if o == "." or rel == o or rel.startswith(o + os.sep) or fnmatch.fnmatch(rel, o):
+            return True
+    return False
+
 
 def cmd_hook(args):
     try:
@@ -1562,6 +1894,11 @@ def cmd_hook(args):
             run = load_json(os.path.join(rd, "run.json"), default={})
             print(f"[harness] orchestrator session. Latest run {rid}: risk={run.get('risk',{}).get('level')} state={run.get('status',{}).get('state')}. "
                   f"`harness status` for details. New work: `harness run new --request '...'`.")
+            sec_dir = os.path.join(root, "security-reviews")
+            reports = [os.path.join(sec_dir, f) for f in os.listdir(sec_dir) if f.endswith(".md")] if os.path.isdir(sec_dir) else []
+            age = (time.time() - max(os.path.getmtime(f) for f in reports)) / 86400 if reports else None
+            if age is None or age > 7:
+                print(f"[harness] weekly security review is due ({'never run here' if age is None else f'last one {int(age)} days ago'}). Run /security-weekly when convenient.")
         else:
             print("[harness] orchestrator session (Fable). No runs in this project yet. Change-producing requests go through `harness run new`.")
         return
@@ -1579,19 +1916,27 @@ def cmd_hook(args):
                 print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
                                   "permissionDecisionReason": f"harness: role '{role}' is read-only for product code. You may only write under your task dir {task_dir_env}. Record findings in result.json instead of fixing them."}}))
                 return
+            if in_task_dir and os.path.basename(path) in CONTROL_FILES and os.path.dirname(os.path.abspath(path)) == os.path.abspath(task_dir_env):
+                print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                  "permissionDecisionReason": "harness: workers may not change the files that define their own task."}}))
+                return
+            try:
+                owned = json.loads(os.environ.get("HARNESS_OWNED_PATHS") or "[]")
+            except json.JSONDecodeError:
+                owned = []
+            if write_allowed and not in_task_dir and (owned or role == "blueprint") and not path_owned(path, owned, project_root()):
+                print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                  "permissionDecisionReason": f"harness: this task may only write inside its owned paths {owned}. Report the need for other files in result.json instead."}}))
+                return
             if path and os.path.abspath(path).startswith(os.path.abspath(os.path.join(project_root(), ".harness"))) and not in_task_dir:
                 print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
                                   "permissionDecisionReason": "harness: workers may not modify other tasks' evidence, policy, waivers, or approvals."}}))
                 return
         if tool == "Bash":
-            cmd = ti.get("command", "")
-            if re.search(r"harness\s+(gate|waiver|approve|run\s+set)\b", cmd):
+            reason = bash_denial(ti.get("command", ""), role, write_allowed)
+            if reason:
                 print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
-                                  "permissionDecisionReason": "harness: workers may not evaluate the gate, issue waivers/approvals, or edit run classification."}}))
-                return
-            if not write_allowed and re.search(r"\bgit\s+(commit|push|checkout\s+--|reset|stash|rebase|merge|cherry-pick|clean|rm|mv|add)\b", cmd):
-                print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
-                                  "permissionDecisionReason": f"harness: role '{role}' is read-only; git state-changing commands are blocked."}}))
+                                  "permissionDecisionReason": reason}}))
                 return
         return
     if args.event == "stop":
@@ -1645,6 +1990,7 @@ def cmd_doctor(args):
     checks.append(("TERM_PROGRAM", os.environ.get("TERM_PROGRAM", "(unset)")))
     checks.append(("terminal backend", detect_terminal(cfg)))
     checks.append(("worker model/effort", f"{cfg.get('worker_model')} / {cfg.get('worker_effort')}"))
+    checks.append(("blueprint model", agent_setting(cfg, "agent_models", "blueprint")))
     checks.append(("worker permission mode", cfg.get("worker_permission_mode")))
     checks.append(("agents dir", str(len([f for f in os.listdir(os.path.expanduser('~/.claude/agents')) if f.endswith('.md')])) + " agent definitions"))
     checks.append(("packs", str(len(all_packs())) + " practice packs"))
@@ -1695,7 +2041,8 @@ def main():
 
     t = sp.add_parser("task", help="work packages").add_subparsers(dest="sub", required=True)
     s = t.add_parser("new"); s.add_argument("--run"); s.add_argument("--id", required=True); s.add_argument("--agent", required=True); s.add_argument("--role", required=True)
-    s.add_argument("--write", action="store_true", default=None); s.add_argument("--depends"); s.add_argument("--retry-of"); s.add_argument("--title"); s.add_argument("--package-file"); s.add_argument("--revision"); s.set_defaults(fn=cmd_task_new)
+    s.add_argument("--write", action="store_true", default=None); s.add_argument("--depends"); s.add_argument("--retry-of"); s.add_argument("--title"); s.add_argument("--package-file"); s.add_argument("--revision")
+    s.add_argument("--owned", help="comma-separated files/folders (relative to the project) this task may write; required for blueprint"); s.set_defaults(fn=cmd_task_new)
     s = t.add_parser("list"); s.add_argument("--run"); s.set_defaults(fn=cmd_task_list)
 
     s = sp.add_parser("spawn", help="launch a worker session in a new terminal tab"); s.add_argument("--run"); s.add_argument("--task", required=True)
@@ -1718,6 +2065,11 @@ def main():
     s = sp.add_parser("approve", help="(human) record release/R3 approval"); s.add_argument("--run"); s.add_argument("--by", required=True); s.add_argument("--role"); s.add_argument("--scope"); s.add_argument("--note"); s.set_defaults(fn=cmd_approve)
 
     s = sp.add_parser("gate", help="evaluate the policy gate"); s.add_argument("--run"); s.add_argument("--count-cycle", action="store_true", help="count a FAIL as a remediation cycle"); s.set_defaults(fn=cmd_gate)
+    b = sp.add_parser("blueprint", help="blueprint comments: strip + backup, check, commit the backup").add_subparsers(dest="sub", required=True)
+    s = b.add_parser("strip", help="back up blueprinted files to blueprints/<run>/, then remove `BP:` comment lines from non-test code"); s.add_argument("--run"); s.add_argument("--dry-run", action="store_true"); s.set_defaults(fn=cmd_blueprint_strip)
+    s = b.add_parser("check", help="exit 1 if changed non-test files still hold blueprint comments"); s.set_defaults(fn=cmd_blueprint_check)
+    s = b.add_parser("commit-backup", help="(orchestrator) commit only blueprints/<run>/ after the gate passed; never pushes"); s.add_argument("--run"); s.set_defaults(fn=cmd_blueprint_commit_backup)
+    s = sp.add_parser("followup", help="(orchestrator) record a non-critical finding as follow-up work instead of blocking"); s.add_argument("--run"); s.add_argument("--finding", nargs="+", required=True); s.add_argument("--reason", required=True); s.set_defaults(fn=cmd_followup)
     s = sp.add_parser("report", help="final user report from gate + evidence"); s.add_argument("--run"); s.set_defaults(fn=cmd_report)
     s = sp.add_parser("hook", help="internal: Claude Code hook handler"); s.add_argument("event", choices=["session-start", "pre-tool-use", "stop"]); s.set_defaults(fn=cmd_hook)
 

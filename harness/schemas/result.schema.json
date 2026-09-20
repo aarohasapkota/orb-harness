@@ -20,6 +20,8 @@
     "packs_loaded[]": "practice pack ids you read.",
     "requirements_covered[]": "requirement ids (e.g. PW.5.1, OWASP-A03) you verified.",
     "handoff": "{next_agent, reason}",
+    "closed_findings[]": "final-review only: ids of first-round findings you verified as fixed, written as `<task-id>:<finding-id>` (e.g. `cr-1:F2`). The gate stops counting those as open.",
+    "friction[]": "optional, any role: things that slowed you down for no good reason, as {kind, detail}. kind is one of hook-false-positive, missing-context, reread-large-file, unclear-package, tool-missing, other. The orchestrator collects these into the lessons file to improve prompts and hooks.",
     "summary": "free text, <= 400 chars, for the orchestrator"
   }
 }

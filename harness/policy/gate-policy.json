@@ -1,57 +1,196 @@
 {
   "policy_id": "harness-default-gate",
-  "version": "2026-09-05",
-  "$comment": "Deterministic reference policy evaluated by `harness gate`. A project may tighten it by adding .harness/policy/gate-policy.json (merged as overrides that can only add roles or lower thresholds; weakening is ignored). Roles here are the task roles in task.json, produced by the agents listed in the agent registry.",
+  "version": "2026-09-19-team",
+  "$comment": "Deterministic policy evaluated by `harness gate`. Shaped like a small startup engineering team: the human sets direction, the orchestrator is the tech lead, an Opus blueprint is the spec (and the security baseline), Sonnet engineers build, three peer reviewers look in parallel, one fix pass, one final review. Deep security work (threat model, security testing, secure defaults, build and release checks) runs in the weekly security review, not on every change. A project may tighten this in .harness/policy/gate-policy.json.",
   "risk_profiles": {
     "R0": {
-      "required_roles": ["implementer", "code-review"],
+      "required_roles": [
+        "implementer",
+        "code-review"
+      ],
       "conditional_roles": {}
     },
     "R1": {
-      "required_roles": ["requirements", "implementer", "test-verification", "code-review"],
-      "conditional_roles": {"dependency-review": "third_party_code_added", "domain-specialist": "persistent_data_affected"}
+      "required_roles": [
+        "implementer",
+        "code-review",
+        "test-verification"
+      ],
+      "conditional_roles": {
+        "dependency-review": "third_party_code_added"
+      }
     },
     "R2": {
-      "required_roles": ["requirements", "threat-model", "implementer", "test-verification", "code-review", "security-review", "security-testing"],
-      "conditional_roles": {"dependency-review": "third_party_code_added", "domain-specialist": "persistent_data_affected",
-                            "build-security": "build_or_release_path_affected", "ai-adversarial-testing": "ai_scope"}
+      "required_roles": [
+        "blueprint",
+        "implementer",
+        "code-review",
+        "security-review",
+        "test-verification"
+      ],
+      "conditional_roles": {
+        "dependency-review": "third_party_code_added"
+      }
     },
     "R3": {
-      "required_roles": ["requirements", "threat-model", "architecture-review", "implementer", "test-verification", "code-review", "security-review", "security-testing", "secure-defaults"],
-      "conditional_roles": {"dependency-review": "third_party_code_added", "domain-specialist": "persistent_data_affected",
-                            "build-security": "build_or_release_path_affected", "release-integrity": "build_or_release_path_affected",
-                            "ai-adversarial-testing": "ai_scope"}
+      "required_roles": [
+        "blueprint",
+        "implementer",
+        "code-review",
+        "security-review",
+        "test-verification"
+      ],
+      "conditional_roles": {
+        "dependency-review": "third_party_code_added"
+      }
     }
   },
-  "vulnerability_response_roles": ["vulnerability-discovery", "triage", "remediation", "code-review", "security-testing"],
-  "never_not_applicable": ["implementer", "code-review", "remediation"],
+  "vulnerability_response_roles": [
+    "vulnerability-discovery",
+    "triage",
+    "remediation",
+    "code-review",
+    "security-testing"
+  ],
+  "never_not_applicable": [
+    "implementer",
+    "code-review",
+    "remediation",
+    "blueprint"
+  ],
   "on_missing": {
-    "requirements": "FAIL", "threat-model": "FAIL", "architecture-review": "FAIL", "implementer": "FAIL", "test-verification": "FAIL",
-    "code-review": "FAIL", "security-review": "FAIL", "security-testing": "FAIL", "dependency-review": "FAIL", "domain-specialist": "NEEDS_HUMAN",
-    "build-security": "FAIL", "release-integrity": "NEEDS_HUMAN", "secure-defaults": "NEEDS_HUMAN", "ai-adversarial-testing": "FAIL",
-    "vulnerability-discovery": "FAIL", "triage": "FAIL", "remediation": "FAIL", "root-cause": "NEEDS_HUMAN", "regression-prevention": "NEEDS_HUMAN",
-    "secrets-scan": "FAIL"
+    "requirements": "FAIL",
+    "threat-model": "FAIL",
+    "architecture-review": "FAIL",
+    "implementer": "FAIL",
+    "test-verification": "FAIL",
+    "code-review": "FAIL",
+    "security-review": "FAIL",
+    "security-testing": "FAIL",
+    "dependency-review": "FAIL",
+    "domain-specialist": "NEEDS_HUMAN",
+    "build-security": "FAIL",
+    "release-integrity": "NEEDS_HUMAN",
+    "secure-defaults": "NEEDS_HUMAN",
+    "ai-adversarial-testing": "FAIL",
+    "vulnerability-discovery": "FAIL",
+    "triage": "FAIL",
+    "remediation": "FAIL",
+    "root-cause": "NEEDS_HUMAN",
+    "regression-prevention": "NEEDS_HUMAN",
+    "secrets-scan": "FAIL",
+    "blueprint": "FAIL",
+    "final-review": "FAIL"
   },
   "finding_thresholds": {
-    "R0": {"blocking": ["critical", "high"], "waivable": ["high"]},
-    "R1": {"blocking": ["critical", "high"], "waivable": ["high"]},
-    "R2": {"blocking": ["critical", "high"], "waivable": ["high"]},
-    "R3": {"blocking": ["critical", "high", "medium"], "waivable": ["high", "medium"]}
+    "R0": {
+      "blocking": [
+        "critical",
+        "high"
+      ],
+      "waivable": [
+        "high"
+      ]
+    },
+    "R1": {
+      "blocking": [
+        "critical",
+        "high"
+      ],
+      "waivable": [
+        "high"
+      ]
+    },
+    "R2": {
+      "blocking": [
+        "critical",
+        "high"
+      ],
+      "waivable": [
+        "high"
+      ]
+    },
+    "R3": {
+      "blocking": [
+        "critical",
+        "high",
+        "medium"
+      ],
+      "waivable": [
+        "high",
+        "medium"
+      ]
+    }
   },
-  "non_waivable": ["critical findings", "author-as-reviewer", "reviewer modified files", "stale review evidence", "failed required tests", "invalid result records"],
+  "non_waivable": [
+    "critical findings",
+    "author-as-reviewer",
+    "reviewer modified files",
+    "stale review evidence",
+    "failed required tests",
+    "invalid result records",
+    "blueprint comments left in code",
+    "blueprint author or final reviewer is also a first-round reviewer"
+  ],
   "remediation_routes": {
-    "finding": "implementer", "code-review": "implementer", "security-review": "implementer", "security-testing": "implementer",
-    "test-verification": "implementer", "dependency-review": "dependency-review", "threat-model": "threat-model",
-    "architecture-review": "architecture-review", "build-security": "domain-specialist", "release-integrity": "release-integrity",
-    "ai-adversarial-testing": "implementer", "requirements": "requirements", "secure-defaults": "implementer",
-    "vulnerability-discovery": "vulnerability-discovery", "triage": "triage", "remediation": "remediation",
-    "root-cause": "root-cause", "regression-prevention": "regression-prevention"
+    "finding": "implementer",
+    "code-review": "implementer",
+    "security-review": "implementer",
+    "security-testing": "implementer",
+    "test-verification": "implementer",
+    "dependency-review": "dependency-review",
+    "threat-model": "threat-model",
+    "architecture-review": "architecture-review",
+    "build-security": "domain-specialist",
+    "release-integrity": "release-integrity",
+    "ai-adversarial-testing": "implementer",
+    "requirements": "requirements",
+    "secure-defaults": "implementer",
+    "vulnerability-discovery": "vulnerability-discovery",
+    "triage": "triage",
+    "remediation": "remediation",
+    "root-cause": "root-cause",
+    "regression-prevention": "regression-prevention",
+    "blueprint": "blueprint",
+    "final-review": "implementer"
   },
   "separation_of_duties": {
     "implementer_not_reviewer": true,
     "code_review_not_security_testing": true,
     "r3_security_review_distinct_from_code_review": true,
     "reviewers_read_only": true,
-    "review_bound_to_final_revision": true
-  }
+    "review_bound_to_final_revision": true,
+    "final_review_distinct_from_lenses": true,
+    "blueprint_author_not_reviewer": true
+  },
+  "review_shape": {
+    "lenses": [
+      "code-review",
+      "security-review",
+      "test-verification"
+    ],
+    "final_review_after_fix": [
+      "R1",
+      "R2",
+      "R3"
+    ],
+    "$comment": "Reviewers run once, in parallel. Their findings are merged and fixed in one pass. If a fix pass happened, one final-review (a different agent) confirms each finding is closed and the fix broke nothing; the first-round reviews then do not need to be repeated. New findings from the final review block only when critical or high."
+  },
+  "weekly_security_review": {
+    "roles": [
+      "threat-model",
+      "security-testing",
+      "secure-defaults",
+      "dependency-review",
+      "build-security",
+      "release-integrity",
+      "ai-adversarial-testing"
+    ],
+    "$comment": "Run by /security-weekly over the last 7 days of changes. Findings become new change requests."
+  },
+  "orchestrator_may_defer": [
+    "high",
+    "medium",
+    "low"
+  ]
 }

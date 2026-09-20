@@ -15,28 +15,26 @@ Selection priority (highest first): system/org security requirements → reposit
 
 Invariants for every workflow: security is not a final phase; required agents run at their injection points; mandatory gates pass before protected transitions; reclassify when scope/risk changes; failed mandatory gate never counts as pass; `not_applicable` needs a rationale; backfill earlier stages when late discoveries invalidate them; AI-generated code gets the same scrutiny.
 
-## Gate matrix (mandatory task roles per risk level, enforced by `harness gate`)
+## Required roles per risk level (enforced by `harness gate`)
+
+The team is shaped like a small startup engineering team: a spec, an engineer, three peer reviewers in parallel, one fix pass, one final review. Deep security work runs weekly (`/security-weekly`), not on every change.
 
 | Role (agent) | R0 | R1 | R2 | R3 |
 |---|:-:|:-:|:-:|:-:|
+| blueprint (blueprint, Opus) — spec as `BP:` comments, security baseline; before the implementer | – | – | M | M |
 | implementer (secure-coding; orchestrator itself allowed for R0 docs) | M | M | M | M |
-| code-review | M | M | M | M |
-| requirements | – | M | M | M |
-| test-verification | – | M | M | M |
-| threat-model (threat-modeling) | – | – | M | M |
-| security-review | – | – | M | M |
-| security-testing | – | – | M | M |
-| architecture-review (before implementation) | – | – | – | M |
-| secure-defaults | – | – | – | M |
+| code-review — correctness lens | M | M | M | M |
+| test-verification — tests and failure lens | – | M | M | M |
+| security-review — security lens, runs negative tests | – | – | M | M |
+| final-review — only after a fix pass; closure and regression only | – | F | F | F |
 | dependency-review (dependency-vetting) | – | C¹ | C¹ | C¹ |
-| domain-specialist (data-migration / ci-cd-platform / ai-agent-security) | – | C² | C² | C² |
-| build-security | – | – | C³ | C³ |
-| release-integrity | – | – | – | C³ |
-| ai-adversarial-testing | – | – | A | A |
 | secrets scan evidence | – | – | M | M |
+| blueprint comments stripped from code, kept in tests, backed up in `blueprints/<run>/` | – | – | M | M |
 | human approval (`harness approve`) | – | – | – | M |
 | findings blocking | crit/high | crit/high | crit/high | crit/high/medium |
 
-M mandatory · C conditional (¹ third_party_code_added or manifest diff · ² persistent_data_affected / AI scope / build path · ³ build_or_release_path_affected) · A mandatory when ai_scope ≠ none.
+M mandatory · F mandatory once an implementer retry (fix pass) exists; a passing final review on the current revision covers the first-round reviews, which are not repeated · C¹ when third_party_code_added or a manifest changed.
+On call, never required by default: requirements, threat-model, architecture-review, governance, domain-specialist, security-testing, secure-defaults, build-security, release-integrity, ai-adversarial-testing. The orchestrator brings one in when a change clearly needs it; most of them run in the weekly security review.
 Vulnerability-response mode adds: vulnerability-discovery, triage, remediation (replaces implementer), code-review, security-testing, and for R2+: root-cause, regression-prevention.
-Non-waivable: critical findings, author-as-reviewer, reviewer wrote files, stale review revision, failed required tests, invalid result records. High/medium findings are waivable only by the human via `harness waiver`.
+Tech-lead authority: the orchestrator may record any non-critical finding as follow-up (`harness followup`, with a reason); it then stops blocking and is listed in the report. Critical findings can never be deferred or waived.
+Non-waivable: critical findings, author-as-reviewer, blueprint author or final reviewer acting as a first-round reviewer, reviewer wrote files, stale review revision (unless covered by the final review), failed required tests, invalid result records, blueprint comments left in code.
