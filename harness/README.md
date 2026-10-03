@@ -1,15 +1,19 @@
-# Claude Code secure-SDLC harness — user guide
+# orb-harness — user guide
 
 ## Daily use
 
-1. Open **cmux** (Ghostty-based terminal with vertical tabs), open a tab in your project folder and start `claude`. That session is the **orchestrator** (Fable 5.1). It stays yours; it never blocks on workers.
-2. Ask for a change in plain language, or `/harness <request>`.
-3. The orchestrator opens a run, classifies risk (R0–R3), creates work packages, and spawns Sonnet (effort high) workers **into new cmux workspaces (vertical tabs)** named `<task-id> <agent>`, without stealing focus. Each shows a `harness` status pill; a cmux notification fires when a worker finishes. Watch them if you like; don't type into them.
-4. When workers finish, the orchestrator runs the gate. You will see one of:
-   - `PASS` → final report (what changed, what was verified, who reviewed, evidence paths).
-   - `FAIL` → it routes fixes to the right worker and re-verifies (max 2 cycles), then reports BLOCKED if still failing.
-   - `NEEDS_HUMAN` → it asks you for a decision and gives you the exact command, e.g. `! harness approve --run <id> --by human:<you>` (R3 changes always need this) or `! harness waiver --run <id> --finding F-1 --reason "..." --approved-by human:<you>`.
-5. `harness status` / `/gate` any time. Everything is under `<project>/.harness/runs/<run-id>/`.
+You are the technical CEO; the harness is your engineering team.
+
+1. Open **cmux**, open a tab in your project folder and start `claude`. That session is your **tech lead** (Fable 5.1). It stays yours; it never blocks on workers.
+2. Say what you want in plain language, or `/harness <request>`. Settle the architecture and integration choices with the tech lead; it writes them into a brief.
+3. The tech lead splits the work into small runs and gives each a risk level: R0 docs, R1 small local change, R2 medium (outside input, data, dependencies, public interfaces), R3 high (login, permissions, secrets, releases, infrastructure, AI tool use).
+4. For R2 and R3 an **Opus** worker writes the spec as `BP:` comments into the code and test files. A **Sonnet** engineer builds under them. When tests pass, the comments are removed from the code, kept in the tests, and backed up under `blueprints/<run-id>/`.
+5. **Three Sonnet reviewers** look once, in parallel (correctness, security, tests). The tech lead merges what they found, decides what is fixed now and what becomes follow-up, runs **one fix**, then **one final review**. Workers open as cmux tabs named `<task-id> <agent>`; don't type into them.
+6. The final check (`harness gate`) gives one of:
+   - `PASS` → a plain-language report, and the blueprint backup is committed (only that folder, never pushed).
+   - `FAIL` → one more fix and final review at most, then it comes to you.
+   - `NEEDS_HUMAN` → R3 changes need your sign-off: `! harness approve --run <id> --by human:<you>`.
+7. Once a week, when the banner says it is due, run `/security-weekly` for the deep security pass.
 
 ## One-time setup
 
@@ -19,14 +23,14 @@
 
 ## Configuration (`~/.claude/harness/config.json`)
 
-`worker_model` (sonnet) · `worker_effort` (high) · `worker_permission_mode` (auto | acceptEdits | bypassPermissions) · `terminal` (auto | cmux | ghostty | iterm | terminal | tmux | bg; auto prefers cmux) · `return_to_main_tab` (true) · Ghostty tab key bindings · `max_remediation_cycles` (2) · `r3_requires_human_approval` (true).
+`worker_model` (sonnet) · `worker_effort` (high) · `agent_models` (per agent; `blueprint` ships as `claude-opus-4-7`) · `agent_efforts` (per agent; reviewers ship as medium) · `worker_permission_mode` (auto | acceptEdits | bypassPermissions) · `terminal` (auto | cmux | ghostty | iterm | terminal | tmux | bg; auto prefers cmux) · `return_to_main_tab` (true) · Ghostty tab key bindings · `max_remediation_cycles` (2) · `r3_requires_human_approval` (true).
 
 ## Commands you may type yourself
 
-`! harness status` · `! harness report` · `! harness approve --by human:<you>` · `! harness waiver ...` · `! harness runs` · `! harness doctor`
+`! harness status` · `! harness report` · `! harness blueprint check` · `! harness approve --by human:<you>` · `! harness waiver ...` · `! harness runs` · `! harness doctor`
 
-Workers cannot run gate/waiver/approve; hooks block it.
+Workers cannot run gate, waiver, approve, followup or the backup commit, and cannot commit or push; hooks block it.
 
 ## Tests
 
-`python3 ~/.claude/harness/tests/test_gate.py`
+`python3 ~/.claude/harness/tests/test_gate.py` (70 checks; tests the copy it sits in)

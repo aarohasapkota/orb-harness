@@ -1,24 +1,22 @@
-# Risk-based Agile + DevSecOps (default)
+# Risk-based team flow (default)
 
-Depth scales with R-level. Every stage maps to task roles the gate checks.
+Depth scales with the risk level. Every stage maps to task roles the gate checks.
 
 ```
-Context ─▶ Classify (mode, change types, flags, R-level, ai_scope) ─▶ Requirements
-   ─▶ [R2+] Threat model ─▶ [R3] Architecture review (must PASS before implementation)
-   ─▶ [conditional] Dependency vetting / Domain specialist (before implementation depends on it)
-   ─▶ Implementation (secure-coding, write-capable)  ── the only writer of product code
-   ─▶ Verification fan-out (parallel, all read-only, all bound to the same revision):
-        test-verification │ code-review │ [R2+] security-testing │ [R2+] security-review
-        │ [AI] ai-adversarial-testing │ [cond] build-security │ [R3] secure-defaults
-   ─▶ Gate (harness gate) ─▶ PASS → report / FAIL → route → remediate → re-verify (max 2 cycles) / NEEDS_HUMAN → ask
-   ─▶ [R3] human approval (harness approve) ─▶ COMPLETE
+Classify ─▶ settle the design with the human (brief.md) ─▶ [R2+] Blueprint (Opus: BP: comments in code + tests, security baseline)
+   ─▶ Implementation (secure-coding) ─▶ tests pass ─▶ harness blueprint strip ─▶ tests pass again
+   ─▶ Review round, once, in parallel:  code-review │ test-verification │ [R2+] security-review
+   ─▶ orchestrator merges findings: fix now / follow-up (harness followup; never for critical)
+   ─▶ [if anything to fix] one fix pass ─▶ one final-review (closure + regression only)
+   ─▶ Gate ─▶ PASS → report → harness blueprint commit-backup   /   [R3] human approval first
+Weekly: /security-weekly (threat model, security tests, secure defaults, dependencies, build, release)
 ```
 
-| Risk | Stages executed |
+| Risk | Stages |
 |---|---|
-| R0 | context (orchestrator) → implement (orchestrator or secure-coding) → code-review → gate |
-| R1 | context → requirements → implement → test-verification ∥ code-review → gate |
-| R2 | + threat-model before implementation; + security-testing ∥ security-review after; + domain specialist / dependency-vetting when triggered; secrets scan |
-| R3 | + architecture-review PASS before implementation; + secure-defaults; + release-integrity when release path affected; + human approval; medium findings block |
+| R0 | implement (orchestrator or secure-coding) → code-review → gate |
+| R1 | implement → code-review ∥ test-verification → [fix → final-review] → gate |
+| R2 | blueprint → implement + strip → code-review ∥ security-review ∥ test-verification → [fix → final-review] → gate |
+| R3 | as R2, medium findings block unless deferred by the orchestrator, then human approval |
 
-Entry criteria per stage: upstream results PASS (the spawner enforces `--depends`). Exit criteria: result.json validates. Iteration: a FAIL routes to the earliest invalidated stage per the routing matrix in `04-EVIDENCE-AND-GATES` (coding defect → implementation; threat/architecture defect → design; requirement gap → requirements). After remediation, ALL read-only verification re-runs against the new revision (stale evidence is rejected automatically).
+Findings flow forward, never back into another planning round. After two failed fix rounds on the same problem the run stops and goes to the human.

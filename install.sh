@@ -4,7 +4,7 @@
 # Installs the Claude Code secure-SDLC harness into ~/.claude:
 #   ~/.claude/harness/            control plane (CLI, packs, policy, workflows, schemas, templates, tests, docs)
 #   ~/.claude/agents/*.md         23 specialist agent definitions
-#   ~/.claude/skills/{harness,spawn,gate}
+#   ~/.claude/skills/{harness,spawn,gate,security-weekly}
 #   ~/.claude/CLAUDE.md           orchestrator instructions (appended between markers)
 #   ~/.claude/settings.json       hooks (SessionStart / PreToolUse / Stop) + env.HARNESS_HOME (merged)
 #   ~/.local/bin/harness          symlink to the CLI
@@ -98,13 +98,28 @@ run chmod 755 "$HARNESS_HOME/bin/harness"
 if [ -f "$HARNESS_HOME/config.json" ]; then
   log "keeping existing $HARNESS_HOME/config.json (shipped version saved as config.json.dist)"
   run cp "$REPO_DIR/harness/config.json" "$HARNESS_HOME/config.json.dist"
+  # add settings that are new in this version; never change a value you already set
+  if [ "$DRY_RUN" -eq 0 ]; then
+    python3 - "$HARNESS_HOME/config.json" "$REPO_DIR/harness/config.json" <<'PY'
+import json, sys
+mine, shipped = json.load(open(sys.argv[1])), json.load(open(sys.argv[2]))
+added = [k for k in shipped if k not in mine]
+for k in added:
+    mine[k] = shipped[k]
+if added:
+    json.dump(mine, open(sys.argv[1], "w"), indent=2)
+    print("   added new config keys: " + ", ".join(added))
+PY
+  else
+    log "would add any new config keys to the existing config.json"
+  fi
 else
   run cp "$REPO_DIR/harness/config.json" "$HARNESS_HOME/config.json"
 fi
 
 # agents and skills
 run cp "$REPO_DIR"/agents/*.md "$CLAUDE_DIR/agents/"
-for s in harness spawn gate; do
+for s in harness spawn gate security-weekly; do
   run rm -rf "$CLAUDE_DIR/skills/$s"
   run cp -R "$REPO_DIR/skills/$s" "$CLAUDE_DIR/skills/$s"
 done
@@ -114,7 +129,7 @@ if [ "$DRY_RUN" = 0 ]; then
   {
     echo "# files installed by orb-harness $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     for f in "$REPO_DIR"/agents/*.md; do echo "$CLAUDE_DIR/agents/$(basename "$f")"; done
-    for s in harness spawn gate; do echo "$CLAUDE_DIR/skills/$s"; done
+    for s in harness spawn gate security-weekly; do echo "$CLAUDE_DIR/skills/$s"; done
   } > "$HARNESS_HOME/.orb-harness-manifest"
 fi
 

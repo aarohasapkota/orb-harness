@@ -89,7 +89,7 @@ if [ -f "$HARNESS_HOME/.orb-harness-manifest" ]; then
   log "removed agents and skills listed in the manifest"
 else
   for f in "$REPO_DIR"/agents/*.md; do rm -f "$CLAUDE_DIR/agents/$(basename "$f")"; done
-  for s in harness spawn gate; do rm -rf "$CLAUDE_DIR/skills/$s"; done
+  for s in harness spawn gate security-weekly; do rm -rf "$CLAUDE_DIR/skills/$s"; done
   log "removed shipped agents and skills"
 fi
 
